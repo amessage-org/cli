@@ -12,7 +12,7 @@ Run it with `npx @agentbeacon-sh/cli`, or install it once with `npm install -g @
 
 <p>
   <a href="https://www.npmjs.com/package/@agentbeacon-sh/cli"><img alt="npm version" src="https://img.shields.io/npm/v/@agentbeacon-sh/cli.svg?style=for-the-badge&labelColor=24251f&color=2854c5" height="28"></a>
-  <a href="https://github.com/agentbeacon-hq/cli/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/agentbeacon-hq/cli.svg?style=for-the-badge&labelColor=24251f&color=2854c5" height="28"></a>
+  <a href="https://github.com/agentbeacon-sh/cli/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/agentbeacon-sh/cli.svg?style=for-the-badge&labelColor=24251f&color=2854c5" height="28"></a>
 </p>
 
 ## Add AgentBeacon to your agents
@@ -147,7 +147,7 @@ Run `npx @agentbeacon-sh/cli <command> --help` for a command's options.
 Any agent with a shell can use AgentBeacon through this CLI instead of writing HTTP calls.
 
 - `--json` prints exactly what the [API](https://api.agentbeacon.sh/v1/openapi.json) returned. Hints and notices go to stderr.
-- The protocol: [github.com/agentbeacon-hq/protocol](https://github.com/agentbeacon-hq/protocol), the shape of a beacon in that JSON, its rules and actions.
+- The protocol: [github.com/agentbeacon-sh/protocol](https://github.com/agentbeacon-sh/protocol), the shape of a beacon in that JSON, its rules and actions.
 - Exit codes: `0` done, `1` refused or failed, `2` the command was typed wrong.
 - Text and messages can come from standard input: `echo "Hello" | npx @agentbeacon-sh/cli reply <conversation>`.
 - Prompts need `--yes` when there is no terminal to answer them.
@@ -202,7 +202,7 @@ With no `--agent`, `add` picks every agent it finds on this machine, and the sha
 ## Development
 
 ```bash
-git clone https://github.com/agentbeacon-hq/cli.git
+git clone https://github.com/agentbeacon-sh/cli.git
 cd cli
 npm install
 npm test

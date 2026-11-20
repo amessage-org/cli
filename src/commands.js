@@ -133,10 +133,21 @@ function showQuoted(ctx, markdown) {
 /** @type {Record<string, Command>} */
 export const commands = {
   chat: {
-    group:"Chats",usage:"chat [command-json | -]",summary:"Open your inbox or send a chat command. Use - to read private input from stdin.",
-    async run(ctx,args){
-      const command=args.length ? JSON.parse(await textFrom(ctx,args,undefined)) : {action:"inbox"};
-      ctx.printJson(await (await ctx.client({required:true})).chat(command));
+    group: "Chats",
+    usage: "chat [command-json | -]",
+    summary: "Open your inbox or send a chat command. Use - to read private input from stdin.",
+    async run(ctx, args) {
+      let command = { action: "inbox" };
+      if (args.length) {
+        try {
+          command = JSON.parse(await textFrom(ctx, args, undefined));
+        } catch (error) {
+          if (error instanceof SyntaxError) throw new UsageError("Enter a JSON chat command.");
+          throw error;
+        }
+      }
+      const client = await ctx.client({ required: true });
+      ctx.printJson(await client.chat(command));
     },
   },
   search: {
@@ -148,7 +159,7 @@ export const commands = {
       '"plumber near 78704", "line cook jobs in Austin".',
       "Read each beacon's words to see whether it fits, and check when it expires and what aMessage",
       "checked about who is behind it. Each gives its location, or anywhere, and with a place,",
-      "how far it is and about how many minutes away. Contact details show masked: beacon show",
+      "how far it is and about how many minutes away. Contact details show masked: amessage show",
       "<beacon> shows them. Results come 10 per page, up to 100. Needs no token.",
     ],
     options: {
@@ -163,7 +174,7 @@ export const commands = {
       const options = { location: opts.location, offset: offsetOf(opts.offset) };
       if (ctx.json) return ctx.printJson(await client.search(query, { ...options, json: true }));
       showQuoted(ctx, await client.search(query, options));
-      ctx.hint('Read one: beacon show <beacon>   Message it: amessage message <beacon> "your message"');
+      ctx.hint('Read one: amessage show <beacon>   Message it: amessage message <beacon> "your message"');
     },
   },
 
@@ -335,7 +346,7 @@ export const commands = {
     about: [
       "Say plainly what the person wants, when and where, and how they would like to proceed.",
       "Leave their phone, email and address out unless they asked to share them.",
-      "Participating publishers can be messaged. A job also gives its Apply link in its words: beacon show <beacon>.",
+      "Participating publishers can be messaged. A job also gives its Apply link in its words: amessage show <beacon>.",
       "Connects this agent to aMessage first if it is not connected yet.",
     ],
     async run(ctx, args) {

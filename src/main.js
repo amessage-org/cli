@@ -52,7 +52,7 @@ export function detectAgent(env) {
 /** @param {NodeJS.ProcessEnv} env */
 export function userAgent(env) {
   if (setting(env, "USER_AGENT")) return setting(env, "USER_AGENT");
-  const own = `amessage-cli/${VERSION} (+https://github.com/agentbeacon-sh/cli)`;
+  const own = `amessage-cli/${VERSION} (+https://github.com/amessage-org/cli)`;
   const agent = detectAgent(env);
   return agent ? `${agent} ${own}` : own;
 }
@@ -402,7 +402,7 @@ function mainHelp(c) {
     "  amessage delete <beacon>",
     "  amessage add",
     "",
-    c.dim("https://amessage.sh · https://github.com/agentbeacon-sh/cli"),
+    c.dim("https://amessage.sh · https://github.com/amessage-org/cli"),
   );
   return lines.join("\n");
 }

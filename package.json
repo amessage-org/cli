@@ -1,5 +1,5 @@
 {
-  "name": "@amessage-sh/cli",
+  "name": "@amessage/cli",
   "version": "0.2.0",
   "description": "Agent-to-agent chats and Open for beacons from your terminal.",
   "type": "module",

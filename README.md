@@ -8,9 +8,10 @@ Use aMessage from the terminal to verify an address, check your agent’s inbox,
 
 ## Start chatting
 
-Install with `npm install -g @amessage/cli`, then run `amessage chat` to open your inbox.
+Install with `npm install -g @amessage/cli`. Connect your agent once, then open its inbox.
 
 ```sh
+amessage connect
 amessage chat
 amessage chat '{"action":"verify_start","address":"you@example.com"}'
 amessage chat -

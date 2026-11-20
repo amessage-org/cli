@@ -1,7 +1,7 @@
-// The AgentBeacon agent API, as documented at https://api.agentbeacon.sh/v1/openapi.json.
+// The aMessage agent API, as documented at https://api.amessage.sh/v1/openapi.json.
 
-export const DEFAULT_API = "https://api.agentbeacon.sh";
-export const DEFAULT_WEB = "https://agentbeacon.sh";
+export const DEFAULT_API = "https://api.amessage.sh";
+export const DEFAULT_WEB = "https://amessage.sh";
 
 /** A refusal from the API, carrying its problem details. */
 export class ApiError extends Error {
@@ -24,7 +24,7 @@ export class ApiError extends Error {
 /** An authenticated call with no token to send. */
 export class NotConnected extends Error {
   constructor() {
-    super("This agent is not connected to AgentBeacon yet.");
+    super("This agent is not connected to aMessage yet.");
   }
 }
 
@@ -85,6 +85,8 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
   const id = (/** @type {string} */ value) => encodeURIComponent(value);
 
   return {
+    /** @param {Record<string, unknown>} command */
+    chat: (command) => request("POST", "/v1/chat", {body:command,auth:"required"}),
     get skillCurrent() {
       return skillCurrent;
     },

@@ -22,7 +22,7 @@ const ALIASES = /** @type {Record<string, string>} */ ({
 const GLOBAL = {
   json: { type: /** @type {const} */ ("boolean"), help: "Print the API's JSON, for scripts and agents" },
   yes: { type: /** @type {const} */ ("boolean"), short: "y", help: "Answer yes to every prompt" },
-  api: { type: /** @type {const} */ ("string"), hint: "url", help: `Use another AgentBeacon API (default ${DEFAULT_API})` },
+  api: { type: /** @type {const} */ ("string"), hint: "url", help: `Use another aMessage API (default ${DEFAULT_API})` },
   help: { type: /** @type {const} */ ("boolean"), short: "h", help: "Show help" },
 };
 
@@ -31,7 +31,7 @@ class Cancelled extends Error {}
 
 /**
  * The agent running this CLI, if one is, from the variables agents set.
- * It leads the User-Agent so AgentBeacon can see which agents turn up.
+ * It leads the User-Agent so aMessage can see which agents turn up.
  * @param {NodeJS.ProcessEnv} env
  */
 export function detectAgent(env) {
@@ -52,7 +52,7 @@ export function detectAgent(env) {
 /** @param {NodeJS.ProcessEnv} env */
 export function userAgent(env) {
   if (setting(env, "USER_AGENT")) return setting(env, "USER_AGENT");
-  const own = `agentbeacon-cli/${VERSION} (+https://github.com/agentbeacon-sh/cli)`;
+  const own = `amessage-cli/${VERSION} (+https://github.com/agentbeacon-sh/cli)`;
   const agent = detectAgent(env);
   return agent ? `${agent} ${own}` : own;
 }
@@ -130,7 +130,7 @@ export async function main(argv, io = {}) {
 
   const credentials = async () => {
     const fromEnv = setting(env, "TOKEN");
-    if (fromEnv) return { token: fromEnv, agent_id: null, source: "AGENTBEACON_TOKEN" };
+    if (fromEnv) return { token: fromEnv, agent_id: null, source: "AMESSAGE_TOKEN" };
     const saved = await loadCredentials(file, api);
     return saved ? { ...saved, source: tilde(file) } : null;
   };
@@ -189,7 +189,7 @@ export async function main(argv, io = {}) {
       tokenSource = tilde(file);
       client = null;
       const say = primary && !ctx.json ? ctx.out : (/** @type {string} */ line) => write(stderr, line);
-      say(c.green(`Connected this agent to AgentBeacon. Agent ${clean(result.agent_id)}.`));
+      say(c.green(`Connected this agent to aMessage. Agent ${clean(result.agent_id)}.`));
       say(c.dim(`The token is saved in ${tilde(file)}, readable only by you.`));
       return result;
     },
@@ -290,7 +290,7 @@ function report(ctx, stderr, error, command) {
   }
   if (error instanceof NotConnected) {
     say(c.red(error.message));
-    say("Run beacon connect, or create a beacon with beacon create, which connects on the way.");
+    say("Run amessage connect, or create a beacon with amessage create, which connects on the way.");
     return 1;
   }
   if (error instanceof ApiError) {
@@ -300,10 +300,10 @@ function report(ctx, stderr, error, command) {
     // What the API says to do next, except for a token it refused: the CLI says that its own way.
     if (error.next && error.status !== 401) say(clean(error.next));
     if (error.status === 401) {
-      say(`AgentBeacon did not accept the token from ${ctx.tokenSource ?? "this machine"}. If it was revoked, its owner can check on the account page.`);
+      say(`aMessage did not accept the token from ${ctx.tokenSource ?? "this machine"}. If it was revoked, its owner can check on the account page.`);
       say(c.dim("Connecting again would make a separate account, so it is not a fix."));
     } else if (error.code === "account_not_linked") {
-      say("Someone has to sign in to this account first. The link is in: beacon me");
+      say("Someone has to sign in to this account first. The link is in: amessage me");
     }
     if (error.retryAfter) {
       const seconds = Number(error.retryAfter);
@@ -328,7 +328,7 @@ async function noteNewerSkill(ctx, current) {
   for (const { dir } of plan) {
     const here = await occupant(dir).catch(() => null);
     if (here?.kind === "ours" && here.version && outOfDate(here.version, current)) {
-      ctx.hint(`A newer AgentBeacon skill is out (${clean(current)}). Update your agents with: beacon add`);
+      ctx.hint(`A newer aMessage skill is out (${clean(current)}). Update your agents with: amessage add`);
       return;
     }
   }
@@ -379,11 +379,11 @@ function mainHelp(c) {
   for (const command of Object.values(commands)) (groups[command.group] ??= []).push([command.usage, command.summary]);
   const width = Math.max(...Object.values(commands).map((command) => command.usage.length)) + 3;
   const lines = [
-    `${c.bold("AgentBeacon")} lets anyone create a live beacon about what they have or need, and any AI agent can find`,
-    "it and message them. This CLI searches and messages beacons, keeps your own open, and adds the AgentBeacon",
+    `${c.bold("aMessage")} lets anyone create a live beacon about what they have or need, and any AI agent can find`,
+    "it and message them. This CLI searches and messages beacons, keeps your own open, and adds the aMessage",
     "skill to your agents.",
     "",
-    `${c.bold("Usage")}  beacon <command> [options]`,
+    `${c.bold("Usage")}  amessage <command> [options]`,
   ];
   for (const [group, rows] of Object.entries(groups)) {
     lines.push("", c.bold(group));
@@ -395,14 +395,14 @@ function mainHelp(c) {
     ...optionLines({ ...GLOBAL, version: { short: "v", help: "Show the version" } }),
     "",
     c.bold("Examples"),
-    '  beacon search "a plumber near 78704"',
-    '  beacon message <beacon> "Can you come at 10?"',
-    '  beacon create "Example Plumbing, Austin. Repairs, repipes and water heaters. Email quotes@example.com." --lat 30.2416 --lng -97.7695',
-    "  beacon renew <beacon>",
-    "  beacon delete <beacon>",
-    "  beacon add",
+    '  amessage search "a plumber near 78704"',
+    '  amessage message <beacon> "Can you come at 10?"',
+    '  amessage create "Example Plumbing, Austin. Repairs, repipes and water heaters. Email quotes@example.com." --lat 30.2416 --lng -97.7695',
+    "  amessage renew <beacon>",
+    "  amessage delete <beacon>",
+    "  amessage add",
     "",
-    c.dim("https://agentbeacon.sh · https://github.com/agentbeacon-sh/cli"),
+    c.dim("https://amessage.sh · https://github.com/agentbeacon-sh/cli"),
   );
   return lines.join("\n");
 }
@@ -410,7 +410,7 @@ function mainHelp(c) {
 /** @param {string} name @param {import("./output.js").Palette} c */
 function commandHelp(name, c) {
   const command = commands[name];
-  const lines = [`${c.bold("Usage")}  beacon ${command.usage} [options]`, "", `${command.summary}.`];
+  const lines = [`${c.bold("Usage")}  amessage ${command.usage} [options]`, "", `${command.summary}.`];
   if (command.about?.length) lines.push("", ...command.about);
   lines.push("", c.bold("Options"), ...optionLines({ ...(command.options ?? {}), ...GLOBAL }));
   return lines.join("\n");

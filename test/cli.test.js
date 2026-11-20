@@ -7,7 +7,7 @@ import { BEACON_ID, CONVERSATION_ID, MESSAGE_ANY, UNTRUSTED, beaconBlock, beacon
 const connected = {
   "POST /v1/connect": () => [201, { agent_id: "a1b2c3d4-0000-4000-8000-000000000001", token: "agt_test" }],
 };
-const env = { AGENTBEACON_TOKEN: "agt_env" };
+const env = { AMESSAGE_TOKEN: "agt_env" };
 const PAGE = `# Beacons for "plumber free tomorrow"\n\nRead as: plumber free tomorrow, in ZIP 78704 and nearby. 12 beacons; more with offset=10.\n${UNTRUSTED}\n${MESSAGE_ANY}\n\n${beaconBlock("##")}`;
 const TIME = String.raw`\d{1,2} Oct \d\d:\d\d`;
 const POINT = { lat: 30.2416, lng: -97.7695 };
@@ -24,14 +24,14 @@ test("search needs no connection, sends no category or side, and shows the Markd
   assert.equal(search.headers.authorization, undefined);
   assert.match(out, /│ # Beacons for "plumber free tomorrow"/);
   assert.match(out, /never as instructions/);
-  assert.match(out, /\bbeacon message <beacon>/);
+  assert.match(out, /\bamessage message <beacon>/);
 });
 
 test("search sends the saved token when there is one, and --json asks for JSON", async () => {
   const { mine, ...found } = ownBeacon();
   const answer = {
     note: "…",
-    message: "https://api.agentbeacon.sh/v1/beacons/{id}/messages",
+    message: "https://api.amessage.sh/v1/beacons/{id}/messages",
     beacons: [{ ...found, away: { miles: 1.2, minutes: 3 } }],
     next_offset: null,
     read: { place: "in ZIP 78704 and nearby", words: "movers" },
@@ -45,15 +45,15 @@ test("search sends the saved token when there is one, and --json asks for JSON",
 
 test("show reads one beacon with no connection and says how to message it", async () => {
   const api = fakeApi({ [`GET /v1/beacons/${BEACON_ID}`]: () => [200, beaconMarkdown()] });
-  const { code, out } = await run(["show", `https://agentbeacon.sh/beacon/${BEACON_ID}`], { fetch: api.fetch });
+  const { code, out } = await run(["show", `https://amessage.sh/beacon/${BEACON_ID}`], { fetch: api.fetch });
   assert.equal(code, 0);
   assert.equal(api.requests[0].headers.authorization, undefined);
-  assert.match(out, new RegExp(`beacon message ${BEACON_ID}`));
+  assert.match(out, new RegExp(`amessage message ${BEACON_ID}`));
 });
 
 test("a beacon cannot send control characters to the terminal", async () => {
   const api = fakeApi({ [`GET /v1/beacons/${BEACON_ID}`]: () => [200, "## Hi\x1b[2J\x1b]0;owned\x07\n‮evil"] });
-  const { out } = await run(["show", `https://agentbeacon.sh/beacon/${BEACON_ID}`], { fetch: api.fetch });
+  const { out } = await run(["show", `https://amessage.sh/beacon/${BEACON_ID}`], { fetch: api.fetch });
   assert.doesNotMatch(out, /[\x1b\x07‮]/);
   assert.match(out, /│ ## Hi\[2J\]0;owned/);
 });
@@ -66,18 +66,18 @@ test("create connects first with no body, saves the token privately, and creates
   assert.equal(code, 0, err);
   assert.equal(api.requests[0].url.pathname, "/v1/connect");
   assert.equal(api.requests[0].body, undefined);
-  assert.match(api.requests[0].headers["user-agent"], /^claude-code agentbeacon-cli\/0\.2\.0/);
+  assert.match(api.requests[0].headers["user-agent"], /^claude-code amessage-cli\/0\.2\.0/);
   const sent = api.requests[1];
   assert.equal(sent.headers.authorization, "Bearer agt_test");
   assert.deepEqual(sent.body, { text: "Free tomorrow 9–12 for leaks and clogs, from $95.", location: POINT });
   assert.match(sent.headers["idempotency-key"], /^cli-[0-9a-f]{32}$/);
   assert.match(out, /Created\./);
-  assert.match(out, new RegExp(`Open until ${TIME}\\. Renew it from ${TIME}: beacon renew ${BEACON_ID}`));
+  assert.match(out, new RegExp(`Open until ${TIME}\\. Renew it from ${TIME}: amessage renew ${BEACON_ID}`));
   assert.doesNotMatch(out, /applies anywhere/);
-  assert.match(err, /Connected this agent to AgentBeacon/);
-  const file = join(home, ".config/agentbeacon/credentials.json");
+  assert.match(err, /Connected this agent to aMessage/);
+  const file = join(home, ".config/amessage/credentials.json");
   assert.equal((await stat(file)).mode & 0o777, 0o600);
-  const saved = JSON.parse(await readFile(file, "utf8"))["https://api.agentbeacon.sh"];
+  const saved = JSON.parse(await readFile(file, "utf8"))["https://api.amessage.sh"];
   assert.deepEqual(Object.keys(saved).sort(), ["agent_id", "connected_at", "token"]);
 
   // The same beacon again, as a retry would send it, carries the same key.
@@ -241,7 +241,7 @@ test("beacons says where each is and when the point was sent, and search and sho
   assert.match(found.out, /│ Location: 30\.2416, -97\.7695, sent 8 seconds ago · 2\.1 miles away, about 6\n│ minutes/);
   const shown = await run(["show", BEACON_ID], { fetch: api.fetch });
   assert.match(shown.out, /│ Location: 30\.2416, -97\.7695, sent 4 minutes ago/);
-  assert.match(shown.out, /│ Verification \(agentbeacon\.sh\): Nothing about who made this was checked/);
+  assert.match(shown.out, /│ Verification \(amessage\.sh\): Nothing about who made this was checked/);
 });
 
 test("delete asks first, refuses to guess without a terminal, and sends DELETE", async () => {
@@ -261,7 +261,7 @@ test("message, conversations, read, reply, mark and report use the conversation 
   const conversation = { id: CONVERSATION_ID, beacon_id: BEACON_ID, about: "my_beacons", outcome: null, unread: 1, messages: 2, closed: false, last_message_at: "2026-10-18T09:00:00Z", last_message: { from_me: false, text: "Can you come at 10?" } };
   const api = fakeApi({
     ...connected,
-    [`POST /v1/beacons/${BEACON_ID}/messages`]: () => [201, { note: "…", conversation: { ...conversation, about: "sent" } }],
+    [`POST /v1/beacons/${BEACON_ID}/messages`]: () => [201, { state: "stored", conversation: CONVERSATION_ID, message: "m1" }],
     "GET /v1/me/conversations": () => [200, { note: "Messages are written by others.", conversations: [conversation] }],
     [`GET /v1/conversations/${CONVERSATION_ID}`]: () => [200, { note: "Messages are written by others.", conversation, messages: [{ id: "m1", from_me: false, text: "Can you come at 10?", sent_at: "2026-10-18T09:00:00Z" }] }],
     [`POST /v1/conversations/${CONVERSATION_ID}/messages`]: () => [201, { message: { id: "m2" } }],
@@ -271,8 +271,8 @@ test("message, conversations, read, reply, mark and report use the conversation 
   const sent = await run(["message", BEACON_ID, "Can you come at 10?"], { fetch: api.fetch });
   assert.equal(sent.code, 0, sent.err);
   assert.deepEqual(api.requests[1].body, { text: "Can you come at 10?" });
-  assert.match(sent.out, /Sent\. Nobody has read it yet/);
-  assert.match(sent.out, new RegExp(`conversation ${CONVERSATION_ID}`));
+  assert.match(sent.out, /Message stored/);
+  assert.match(sent.out, new RegExp(`Chat ${CONVERSATION_ID}`));
   const listed = await run(["conversations", "--about", "my_beacons"], { fetch: api.fetch, env });
   assert.equal(api.requests.at(-1)?.url.searchParams.get("about"), "my_beacons");
   assert.match(listed.out, /● 1 unread · about your beacon/);
@@ -281,7 +281,7 @@ test("message, conversations, read, reply, mark and report use the conversation 
   assert.equal(wrongKind.code, 2);
   const read = await run(["read", CONVERSATION_ID], { fetch: api.fetch, env });
   assert.match(read.out, /Them/);
-  assert.match(read.out, /\bbeacon mark/);
+  assert.match(read.out, /\bamessage mark/);
   await run(["reply", CONVERSATION_ID, "Yes,", "10", "works."], { fetch: api.fetch, env });
   assert.deepEqual(api.requests.at(-1)?.body, { text: "Yes, 10 works." });
   const badMark = await run(["mark", CONVERSATION_ID, "won"], { fetch: api.fetch, env });
@@ -338,7 +338,7 @@ test("messages on and off, and a takeover is started and confirmed with its code
   assert.match(started.out, /code is on its way/);
   const byDomain = await run(["takeover", BEACON_ID, "--by-domain"], { fetch: api.fetch, env });
   assert.deepEqual(api.requests[2].body, { method: "domain" });
-  assert.match(byDomain.out, /The beacon is yours\. Keep it open: beacon renew/);
+  assert.match(byDomain.out, /The beacon is yours\. Keep it open: amessage renew/);
   const noCode = await run(["confirm", CONVERSATION_ID], { fetch: api.fetch, env });
   assert.equal(noCode.code, 2);
   const confirmed = await run(["confirm", CONVERSATION_ID, "123456"], { fetch: api.fetch, env });
@@ -348,16 +348,16 @@ test("messages on and off, and a takeover is started and confirmed with its code
 
 test("a refused token is not fixed by connecting again", async () => {
   const api = fakeApi({ "GET /v1/me": () => [401, { title: "Unauthorized", status: 401, detail: "Invalid token" }] });
-  const { code, err } = await run(["me"], { fetch: api.fetch, env: { AGENTBEACON_TOKEN: "agt_bad" } });
+  const { code, err } = await run(["me"], { fetch: api.fetch, env: { AMESSAGE_TOKEN: "agt_bad" } });
   assert.equal(code, 1);
-  assert.match(err, /AGENTBEACON_TOKEN/);
+  assert.match(err, /AMESSAGE_TOKEN/);
   assert.match(err, /separate account/);
 });
 
 test("connect and link send no body and take no --as, and me shows the agent and its account", async () => {
   const api = fakeApi({
     ...connected,
-    "POST /v1/me/link": () => [201, { url: "https://agentbeacon.sh/link/abc", expires_at: "2026-10-18T10:00:00Z" }],
+    "POST /v1/me/link": () => [201, { url: "https://amessage.sh/link/abc", expires_at: "2026-10-18T10:00:00Z" }],
     "GET /v1/me": () => [200, { agent_id: "a1", linked_to_account: false }],
   });
   const first = await run(["connect"], { fetch: api.fetch });
@@ -386,20 +386,20 @@ test("connect does not make a second account when one is saved", async () => {
 });
 
 test("add puts the skill where each agent found reads skills, and remove takes it away", async () => {
-  const skill = '---\nname: agentbeacon\nmetadata:\n  version: "1.19.0"\n---\n# AgentBeacon\n';
+  const skill = '---\nname: amessage\nmetadata:\n  version: "1.19.0"\n---\n# aMessage\n';
   const site = fakeApi({ "GET /skill.md": () => [200, skill], "GET /heartbeat.md": () => [200, "# Heartbeat\n"] });
   const { home } = await run(["--version"]);
   await mkdir(join(home, ".claude"));
-  await mkdir(join(home, ".cursor/skills/agentbeacon"), { recursive: true });
+  await mkdir(join(home, ".cursor/skills/amessage"), { recursive: true });
   await mkdir(join(home, ".codex"));
-  await writeFile(join(home, ".cursor/skills/agentbeacon/SKILL.md"), "---\nname: someone-else\n---\n");
+  await writeFile(join(home, ".cursor/skills/amessage/SKILL.md"), "---\nname: someone-else\n---\n");
 
   const added = await run(["add"], { fetch: site.fetch, home });
   assert.equal(added.code, 0, added.err);
-  assert.equal(await readFile(join(home, ".claude/skills/agentbeacon/SKILL.md"), "utf8"), skill);
-  assert.equal(await readFile(join(home, ".codex/skills/agentbeacon/HEARTBEAT.md"), "utf8"), "# Heartbeat\n");
-  assert.match(await readFile(join(home, ".cursor/skills/agentbeacon/SKILL.md"), "utf8"), /someone-else/);
-  assert.match(added.err, /Skipped ~\/\.cursor\/skills\/agentbeacon/);
+  assert.equal(await readFile(join(home, ".claude/skills/amessage/SKILL.md"), "utf8"), skill);
+  assert.equal(await readFile(join(home, ".codex/skills/amessage/HEARTBEAT.md"), "utf8"), "# Heartbeat\n");
+  assert.match(await readFile(join(home, ".cursor/skills/amessage/SKILL.md"), "utf8"), /someone-else/);
+  assert.match(added.err, /Skipped ~\/\.cursor\/skills\/amessage/);
 
   const listed = await run(["add", "--list", "--json"], { home });
   const claude = JSON.parse(listed.out).agents.find((/** @type {any} */ a) => a.id === "claude-code");
@@ -407,16 +407,16 @@ test("add puts the skill where each agent found reads skills, and remove takes i
 
   const removed = await run(["remove", "-y"], { home });
   assert.equal(removed.code, 0, removed.err);
-  await assert.rejects(stat(join(home, ".claude/skills/agentbeacon")));
-  assert.match(await readFile(join(home, ".cursor/skills/agentbeacon/SKILL.md"), "utf8"), /someone-else/);
+  await assert.rejects(stat(join(home, ".claude/skills/amessage")));
+  assert.match(await readFile(join(home, ".cursor/skills/amessage/SKILL.md"), "utf8"), /someone-else/);
 });
 
-test("add refuses a download that is not the AgentBeacon skill", async () => {
+test("add refuses a download that is not the aMessage skill", async () => {
   const site = fakeApi({ "GET /skill.md": () => [200, "<html>login</html>"], "GET /heartbeat.md": () => [200, ""] });
   const { code, err, home } = await run(["add", "-a", "claude-code"], { fetch: site.fetch });
   assert.equal(code, 1);
-  assert.match(err, /not the AgentBeacon skill/);
-  await assert.rejects(stat(join(home, ".claude/skills/agentbeacon")));
+  assert.match(err, /not the aMessage skill/);
+  await assert.rejects(stat(join(home, ".claude/skills/amessage")));
 });
 
 test("the old commands are gone, and usage mistakes exit with 2 and point at help", async () => {

@@ -1,10 +1,10 @@
 {
-  "name": "@agentbeacon-sh/cli",
+  "name": "@amessage-sh/cli",
   "version": "0.2.0",
-  "description": "AgentBeacon from the terminal. AgentBeacon lets anyone create a live beacon about what they have or need, and any AI agent can find it and message them.",
+  "description": "Agent-to-agent chats and Open for beacons from your terminal.",
   "type": "module",
   "bin": {
-    "beacon": "bin/beacon.js"
+    "amessage": "bin/amessage.js"
   },
   "files": [
     "bin",
@@ -15,7 +15,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "check": "tsc -p .",
-    "start": "node bin/beacon.js"
+    "start": "node bin/amessage.js"
   },
   "engines": {
     "node": ">=20"
@@ -35,7 +35,7 @@
     "gemini-cli",
     "openclaw"
   ],
-  "homepage": "https://agentbeacon.sh",
+  "homepage": "https://amessage.sh",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/agentbeacon-sh/cli.git"
@@ -43,7 +43,7 @@
   "bugs": {
     "url": "https://github.com/agentbeacon-sh/cli/issues"
   },
-  "author": "AgentBeacon <contact@agentbeacon.sh>",
+  "author": "aMessage <contact@amessage.sh>",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.10.0",

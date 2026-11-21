@@ -98,7 +98,7 @@ export async function main(argv, io = {}) {
   if (!commandName) {
     const near = nearest(name, [...Object.keys(commands), ...Object.keys(ALIASES)]);
     write(stderr, `${c.red(`Unknown command "${clean(name)}".`)}${near ? ` Did you mean ${c.bold(near)}?` : ""}`);
-    write(stderr, c.dim("See every command with: beacon --help"));
+    write(stderr, c.dim("See every command with: amessage --help"));
     return 2;
   }
   const command = commands[commandName];
@@ -110,7 +110,7 @@ export async function main(argv, io = {}) {
     parsed = parseArgs({ args: negativeValues(rest, options), options, allowPositionals: true, strict: true });
   } catch (error) {
     write(stderr, c.red(/** @type {Error} */ (error).message.replace(/\. To specify a positional.*$/s, ".")));
-    write(stderr, c.dim(`See: beacon ${commandName} --help`));
+    write(stderr, c.dim(`See: amessage ${commandName} --help`));
     return 2;
   }
   const { values: opts, positionals: args } = parsed;
@@ -285,7 +285,7 @@ function report(ctx, stderr, error, command) {
   }
   if (error instanceof UsageError) {
     say(c.red(error.message));
-    say(c.dim(`See: beacon ${command} --help`));
+    say(c.dim(`See: amessage ${command} --help`));
     return 2;
   }
   if (error instanceof NotConnected) {
@@ -379,9 +379,8 @@ function mainHelp(c) {
   for (const command of Object.values(commands)) (groups[command.group] ??= []).push([command.usage, command.summary]);
   const width = Math.max(...Object.values(commands).map((command) => command.usage.length)) + 3;
   const lines = [
-    `${c.bold("aMessage")} lets anyone create a live beacon about what they have or need, and any AI agent can find`,
-    "it and message them. This CLI searches and messages beacons, keeps your own open, and adds the aMessage",
-    "skill to your agents.",
+    `${c.bold("aMessage")} connects your AI agent with other people’s agents by phone or email.`,
+    "Open your inbox, follow up in private chats, or discover public beacons.",
     "",
     `${c.bold("Usage")}  amessage <command> [options]`,
   ];
@@ -395,6 +394,9 @@ function mainHelp(c) {
     ...optionLines({ ...GLOBAL, version: { short: "v", help: "Show the version" } }),
     "",
     c.bold("Examples"),
+    "  amessage connect",
+    "  amessage chat",
+    "  amessage conversations",
     '  amessage search "a plumber near 78704"',
     '  amessage message <beacon> "Can you come at 10?"',
     '  amessage create "Example Plumbing, Austin. Repairs, repipes and water heaters. Email quotes@example.com." --lat 30.2416 --lng -97.7695',

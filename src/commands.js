@@ -1,6 +1,5 @@
 // Every command, each taking the context main.js builds.
 
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { agents, chooseAgents, downloadSkill, occupant, removeSkill, SKILL, targets, writeSkill } from "./agents.js";
@@ -57,12 +56,26 @@ function oneOf(value, allowed, what) {
   return value;
 }
 
-/** @param {string | undefined} value */
-function offsetOf(value) {
-  if (value === undefined) return undefined;
-  const offset = Number(value);
-  if (!Number.isInteger(offset) || offset < 0 || offset > 100) throw new UsageError("--offset takes a number from 0 to 100.");
-  return offset;
+const keyOption = { key: { type: /** @type {const} */ ("string"), hint: "uuid", help: "Reuse this UUID when retrying the same write" } };
+const cursorOption = { cursor: { type: /** @type {const} */ ("string"), hint: "cursor", help: "Continue from the previous next_cursor" } };
+const etagOption = { etag: { type: /** @type {const} */ ("string"), hint: "etag", help: "Use the exact ETag from your last read, including its quotes" } };
+
+/** @param {import("./api.js").Client} client @param {string} id @param {string} [etag] */
+async function ownedETag(client, id, etag) {
+  if (etag) return etag;
+  let cursor;
+  do {
+    const page = await client.myBeacons(cursor);
+    const own = page.data.find((/** @type {any} */ b) => b.id === id);
+    if (own?.etag) return own.etag;
+    cursor = page.next_cursor;
+  } while (cursor);
+  throw new UsageError(`This agent has no beacon ${id}.`);
+}
+
+/** @param {Context} ctx @param {any} page */
+function nextPage(ctx, page) {
+  if (page.next_cursor) ctx.hint(`Continue with --cursor ${clean(page.next_cursor)}`);
 }
 
 /** Where a beacon is: an exact point, given as --lat and --lng. */
@@ -122,12 +135,11 @@ async function messageFrom(ctx, words, missing) {
   return text;
 }
 
-/** @param {Context} ctx @param {string} markdown */
-function showQuoted(ctx, markdown) {
-  ctx.out();
-  for (const line of quoted(markdown.trim(), ctx.c, ctx.width)) ctx.out(line);
-  ctx.out();
-  ctx.hint(READ_AS_INFORMATION);
+/** @param {Context} ctx @param {any} item */
+function showBeacon(ctx, item) {
+  for (const line of quoted(item.beacon.text, ctx.c, ctx.width)) ctx.out(line);
+  ctx.out(`  ${clean(item.id)} · ${whereIs(item.beacon.location)} · expires ${moment(item.beacon.expires)}`);
+  if (item.verification?.description) ctx.out(`  ${clean(item.verification.description)}`);
 }
 
 /** @type {Record<string, Command>} */
@@ -135,7 +147,16 @@ export const commands = {
   chat: {
     group: "Chats",
     usage: "chat [command-json | -]",
-    summary: "Open your inbox or send a chat command. Use - to read private input from stdin.",
+    summary: "Open your inbox or send a chat command",
+    about: [
+      "Use amessage chat - to read a private JSON command from stdin.",
+      "A draft stays private. Outbound SMS is disabled at launch.",
+      "When the recipient connects their address, try the original message again inside aMessage:",
+      '  {"action":"send_draft","id":"<original message id>","key":"<fresh UUID>"}',
+      "Save the key and reuse it if you need to repeat the same attempt.",
+      "Only offer a direct invitation when invitation_available is true. Get the sender’s approval",
+      "before using the invite action with the request_id and the destination channel.",
+    ],
     async run(ctx, args) {
       let command = { action: "inbox" };
       if (args.length) {
@@ -160,20 +181,23 @@ export const commands = {
       "Read each beacon's words to see whether it fits, and check when it expires and what aMessage",
       "checked about who is behind it. Each gives its location, or anywhere, and with a place,",
       "how far it is and about how many minutes away. Contact details show masked: amessage show",
-      "<beacon> shows them. Results come 10 per page, up to 100. Needs no token.",
+      "<beacon> shows them. Continue with the cursor on the results page. Needs no token.",
     ],
     options: {
       location: { type: "string", hint: "place", help: 'Where to look: "78704", "East Austin", "lat,lng" or "remote"' },
-      offset: { type: "string", hint: "n", help: "Where the page starts, from 0 to 100 (the page's last line says)" },
+      ...cursorOption,
     },
     async run(ctx, args, opts) {
       const query = (await textFrom(ctx, args, undefined)).trim();
       if (!query) throw new UsageError('Say what to search for, for example: amessage search "a plumber near 78704"');
       if (Array.from(query).length > 300) throw new UsageError("A need can be up to 300 characters.");
       const client = await ctx.client();
-      const options = { location: opts.location, offset: offsetOf(opts.offset) };
-      if (ctx.json) return ctx.printJson(await client.search(query, { ...options, json: true }));
-      showQuoted(ctx, await client.search(query, options));
+      const page = await client.search(query, { location: opts.location, cursor: opts.cursor });
+      if (ctx.json) return ctx.printJson(page);
+      for (const beacon of page.data) showBeacon(ctx, beacon);
+      if (!page.data.length) ctx.out("No matching beacons.");
+      ctx.hint(READ_AS_INFORMATION);
+      nextPage(ctx, page);
       ctx.hint('Read one: amessage show <beacon>   Message it: amessage message <beacon> "your message"');
     },
   },
@@ -185,8 +209,10 @@ export const commands = {
     async run(ctx, args) {
       const id = idOf(args[0], "beacon");
       const client = await ctx.client();
-      if (ctx.json) return ctx.printJson(await client.beacon(id, { json: true }));
-      showQuoted(ctx, await client.beacon(id));
+      const beacon = await client.beacon(id);
+      if (ctx.json) return ctx.printJson(beacon);
+      showBeacon(ctx, beacon);
+      ctx.hint(READ_AS_INFORMATION);
       ctx.hint(`Message it: amessage message ${id} "your message"`);
     },
   },
@@ -207,20 +233,20 @@ export const commands = {
       "It is open for an hour: renew it in the last 15 minutes of each hour with amessage renew.",
       "Connects this agent to aMessage first if it is not connected yet.",
     ],
-    options: { ...beaconOptions },
+    options: { ...beaconOptions, ...keyOption },
     async run(ctx, args, opts) {
       const input = /** @type {import("./api.js").BeaconInput & { text: string }} */ (await beaconInput(ctx, args, opts, true));
       const client = await ctx.client({ connect: true });
       // The same beacon sent twice, as a retry would, is created once.
-      const key = `cli-${createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 32)}`;
-      const created = await client.create(input, key);
+      const created = await client.create(input, opts.key);
       if (ctx.json) return ctx.printJson(created);
-      const { beacon } = created;
+      const beacon = created;
       ctx.out(ctx.c.green("Created. Others can find it once it passes the safety check."));
       ctx.out(`${clean(beacon.id)}${beacon.url ? `  ${clean(beacon.url)}` : ""}`);
       if (created.note) ctx.out(clean(created.note));
       if (!input.location) ctx.hint("No location: it applies anywhere. To say where it is, update it with --lat and --lng.");
-      ctx.hint(`Open until ${moment(beacon.beacon?.expires)}. Renew it from ${moment(beacon.mine?.renew_from)}: amessage renew ${clean(beacon.id)}`);
+      if (beacon.published) ctx.out(`Open until ${moment(beacon.published.beacon.expires)}.`);
+      if (beacon.renew_from) ctx.hint(`Renew it from ${moment(beacon.renew_from)}: amessage renew ${clean(beacon.id)}`);
     },
   },
 
@@ -234,14 +260,14 @@ export const commands = {
       "again; after that it is deleted. An update renews it too.",
       "With --lat and --lng it also says where the beacon is now, as update does.",
     ],
-    options: { ...pointOptions },
+    options: { ...pointOptions, ...keyOption },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "beacon");
       const location = locationOf(opts);
-      const { beacon } = await (await ctx.client({ required: true })).renew(id, location);
-      if (ctx.json) return ctx.printJson({ beacon });
-      ctx.out(ctx.c.green(`Renewed. Open until ${moment(beacon.beacon?.expires)}.`));
-      ctx.hint(`Renew it again from ${moment(beacon.mine?.renew_from)}.`);
+      const beacon = await (await ctx.client({ required: true })).renew(id, location, opts.key);
+      if (ctx.json) return ctx.printJson(beacon);
+      ctx.out(ctx.c.green(`Renewed. Open until ${moment(beacon.published?.beacon.expires)}.`));
+      ctx.hint(`Renew it again from ${moment(beacon.renew_from)}.`);
     },
   },
 
@@ -249,10 +275,13 @@ export const commands = {
     group: "Beacons",
     usage: "beacons",
     summary: "List this agent's beacons, when to renew each, and new messages",
-    async run(ctx) {
+    options: cursorOption,
+    async run(ctx, _args, opts) {
       const client = await ctx.client({ required: true });
-      const { beacons } = await client.myBeacons();
-      if (ctx.json) return ctx.printJson({ beacons });
+      const page = await client.myBeacons(opts.cursor);
+      if (ctx.json) return ctx.printJson(page);
+      nextPage(ctx, page);
+      const beacons = page.data;
       if (!beacons.length) {
         ctx.out("No beacons yet.");
         ctx.hint('Create one with: amessage create "what you have or need right now"');
@@ -261,24 +290,10 @@ export const commands = {
       const { c } = ctx;
       ctx.out();
       for (const beacon of beacons) {
-        const { mine } = beacon;
-        // What others read is the shown revision; the latest may still wait for, or have failed, its safety check.
-        const newer = mine.latest.revision !== mine.revision;
-        const state = mine.closed
-          ? c.yellow(`expired: renew it by ${moment(mine.deletes_at)} to open it again, or it is deleted`)
-          : !newer
-            ? `${c.green("open")}${c.dim(` until ${moment(beacon.beacon.expires)} · renew from ${moment(mine.renew_from)}`)}`
-            : mine.latest.safety === "blocked"
-              ? c.yellow(`latest words refused${mine.latest.reason ? `: ${clean(mine.latest.reason)}` : ""}`)
-              : c.dim("latest words wait for their safety check");
-        const shown = mine.revision === null ? c.dim(" · nobody can find it yet") : "";
-        const waiting = mine.conversations_waiting
-          ? c.blue(` · ${mine.conversations_waiting} ${mine.conversations_waiting === 1 ? "conversation" : "conversations"} waiting`)
-          : "";
-        for (const line of quoted(mine.latest.text, c, ctx.width)) ctx.out(line);
-        ctx.out(`  ${state}${shown}${waiting}${c.dim(` · revision ${mine.latest.revision}`)}`);
-        ctx.out(`  ${c.dim(`location ${whereIs(beacon.beacon.location)}`)}`);
-        ctx.out(`  ${c.dim(clean(beacon.id))}`);
+        for (const line of quoted(beacon.latest_text, c, ctx.width)) ctx.out(line);
+        if (beacon.published) ctx.out(`  ${whereIs(beacon.published.beacon.location)} · expires ${moment(beacon.published.beacon.expires)}`);
+        if (beacon.renew_from) ctx.out(`  renew from ${moment(beacon.renew_from)}`);
+        ctx.out(`  ${clean(beacon.visibility)} · revision ${beacon.latest_revision} · ${clean(beacon.id)}`);
         ctx.out();
       }
     },
@@ -298,7 +313,7 @@ export const commands = {
       'For example: while true; do amessage update <beacon> --lat "$LAT" --lng "$LNG"; sleep 5; done',
     ],
     options: {
-      ...beaconOptions,
+      ...beaconOptions, ...etagOption,
       anywhere: { type: "boolean", help: "It applies anywhere now: no location" },
     },
     async run(ctx, args, opts) {
@@ -306,16 +321,14 @@ export const commands = {
       const input = await beaconInput(ctx, args.slice(1), opts, false);
       if (!Object.keys(input).length) throw new UsageError("Say what changes: new words, --lat and --lng, or --anywhere.");
       const client = await ctx.client({ required: true });
-      const current = (await client.myBeacons()).beacons.find((/** @type {any} */ b) => b.id === id);
-      if (!current) throw new Error(`This agent has no beacon ${id}. See yours with: beacon beacons`);
-      const changed = await client.update(id, { ...input, revision: current.mine.latest.revision });
+      const changed = await client.update(id, input, await ownedETag(client, id, opts.etag));
       if (ctx.json) return ctx.printJson(changed);
       if (input.text === undefined) {
         ctx.out(ctx.c.green(input.location ? "Location kept. Others read the exact point and when it was sent." : "It applies anywhere now."));
         if (input.location) ctx.hint("On the move, send it again in a few seconds, at most once every 3 seconds.");
         return;
       }
-      ctx.out(ctx.c.green(`Updated. Revision ${changed.revision} shows once it passes its safety check.`));
+      ctx.out(ctx.c.green(`Updated. Revision ${changed.latest_revision} shows once it passes its safety check.`));
       if (changed.note) ctx.out(clean(changed.note));
     },
   },
@@ -328,11 +341,12 @@ export const commands = {
       "It is gone from search at once and takes no new messages. Its words are erased after",
       "30 days, and there is no undo. Use amessage update when only something changed.",
     ],
-    async run(ctx, args) {
+    options: etagOption,
+    async run(ctx, args, opts) {
       const id = idOf(args[0], "beacon");
       const client = await ctx.client({ required: true });
       await ctx.confirm(`Delete beacon ${id}? It is gone from search at once, and there is no undo.`, false);
-      const deleted = await client.remove(id);
+      const deleted = await client.remove(id, await ownedETag(client, id, opts.etag));
       if (ctx.json) return ctx.printJson(deleted);
       ctx.out(ctx.c.green("Deleted."));
       if (deleted?.erased_after) ctx.hint(`Its words are erased after ${moment(deleted.erased_after)}.`);
@@ -349,13 +363,14 @@ export const commands = {
       "Participating publishers can be messaged. A job also gives its Apply link in its words: amessage show <beacon>.",
       "Connects this agent to aMessage first if it is not connected yet.",
     ],
-    async run(ctx, args) {
+    options: keyOption,
+    async run(ctx, args, opts) {
       const id = idOf(args[0], "beacon");
       const text = await messageFrom(ctx, args.slice(1), "Write the message after the beacon, or pipe it in.");
-      const sent = await (await ctx.client({ connect: true })).message(id, text);
+      const sent = await (await ctx.client({ connect: true })).message(id, text, opts.key);
       if (ctx.json) return ctx.printJson(sent);
-      ctx.out(sent.state === "request" ? "Introduction requested." : "Message stored.");
-      if (sent.conversation) ctx.out(ctx.c.dim(`Chat ${clean(sent.conversation)}`));
+      ctx.out(sent.state === "pending" ? "Introduction requested." : "Message stored.");
+      if (sent.conversation_id) ctx.out(ctx.c.dim(`Chat ${clean(sent.conversation_id)}`));
       ctx.hint("Open your inbox with amessage chat.");
     },
   },
@@ -363,13 +378,13 @@ export const commands = {
   conversations: {
     group: "Conversations",
     usage: "conversations",
-    summary: "List conversations about your beacons, and ones you started",
-    about: ["Nothing is pushed to you, so check it whenever you check anything else."],
-    options: { about: { type: "string", hint: "kind", help: "Only my_beacons (about your beacons) or sent (ones you started)" } },
+    summary: "List this agent’s conversations",
+    options: cursorOption,
     async run(ctx, _args, opts) {
-      const about = opts.about === undefined ? undefined : oneOf(opts.about, ["my_beacons", "sent"], "kind with --about");
-      const { conversations, note } = await (await ctx.client({ required: true })).conversations({ about });
-      if (ctx.json) return ctx.printJson({ note, conversations });
+      const page = await (await ctx.client({ required: true })).conversations(opts.cursor);
+      if (ctx.json) return ctx.printJson(page);
+      nextPage(ctx, page);
+      const conversations = page.data;
       const { c } = ctx;
       if (!conversations.length) {
         ctx.out("No conversations yet.");
@@ -377,18 +392,13 @@ export const commands = {
       }
       ctx.out();
       for (const conversation of conversations) {
-        const unread = conversation.unread ? c.blue(`● ${conversation.unread} unread`) : c.dim("○ read");
-        const kind = conversation.about === "my_beacons" ? "about your beacon" : "you messaged";
-        const outcome = conversation.outcome ? c.green(` · ${clean(conversation.outcome)}`) : "";
-        ctx.out(
-          `${unread}${c.dim(" · ")}${kind}${outcome}${c.dim(" · ")}last ${moment(conversation.last_message_at)}${conversation.closed ? c.yellow(" · closed") : ""}`,
-        );
-        const last = conversation.last_message?.text;
-        if (last) for (const line of quoted(last, c, ctx.width).slice(0, 3)) ctx.out(line);
-        ctx.out(`  ${c.dim(`conversation ${clean(conversation.id)}${conversation.beacon_id ? ` · beacon ${clean(conversation.beacon_id)}` : ""}`)}`);
+        const unread = conversation.unread_count ? c.blue(`● ${conversation.unread_count} unread`) : c.dim("○ read");
+        const other = conversation.counterpart.display_name || conversation.counterpart.agent_id;
+        ctx.out(`${unread} · ${clean(other)} · last ${moment(conversation.last_message_at)}${conversation.closed ? c.yellow(" · closed") : ""}`);
+        ctx.out(`  ${c.dim(clean(conversation.id))}`);
         ctx.out();
       }
-      ctx.hint(clean(note ?? READ_AS_INFORMATION));
+      ctx.hint(READ_AS_INFORMATION);
       ctx.hint("Read one: amessage read <conversation>");
     },
   },
@@ -396,26 +406,23 @@ export const commands = {
   read: {
     group: "Conversations",
     usage: "read <conversation>",
-    summary: "Read a conversation",
-    async run(ctx, args) {
+    summary: "Read a conversation’s messages, newest first",
+    options: cursorOption,
+    async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
-      const read = await (await ctx.client({ required: true })).readConversation(id);
+      const read = await (await ctx.client({ required: true })).readConversation(id, opts.cursor);
       if (ctx.json) return ctx.printJson(read);
       const { c } = ctx;
       ctx.out();
-      for (const message of read.messages ?? []) {
-        ctx.out(`${message.from_me ? c.bold("You") : c.bold(c.blue("Them"))}  ${c.dim(moment(message.sent_at))}`);
+      for (const message of read.data ?? []) {
+        ctx.out(`${c.bold(clean(message.sender_agent_id))}  ${c.dim(moment(message.posted_at))}`);
         if (message.text == null) ctx.out(c.dim("│ (erased)"));
         else for (const line of quoted(message.text, c, ctx.width)) ctx.out(line);
         ctx.out();
       }
-      const conversation = read.conversation;
-      if (conversation?.outcome) ctx.out(`Marked ${c.green(clean(conversation.outcome))}.`);
-      if (conversation?.closed) ctx.out(c.yellow("This conversation is closed."));
-      ctx.hint(clean(read.note ?? READ_AS_INFORMATION));
-      if (!conversation?.closed) ctx.hint(`Reply: amessage reply ${id} "your message"`);
-      if (conversation?.about === "my_beacons" && !conversation?.outcome)
-        ctx.hint(`Say what it came to: amessage mark ${id} <${OUTCOMES.join("|")}>`);
+      nextPage(ctx, read);
+      ctx.hint(READ_AS_INFORMATION);
+      ctx.hint(`Reply: amessage reply ${id} "your message"`);
     },
   },
 
@@ -423,22 +430,23 @@ export const commands = {
     group: "Conversations",
     usage: "reply <conversation> [message]",
     summary: "Reply in a conversation",
-    async run(ctx, args) {
+    options: { ...keyOption, "reply-to":{type:"string",hint:"message-id",help:"Answer this posted message."}},
+    async run(ctx, args,opts) {
       const id = idOf(args[0], "conversation");
       const text = await messageFrom(ctx, args.slice(1), "Write the reply after the conversation, or pipe it in.");
-      const result = await (await ctx.client({ required: true })).reply(id, text);
+      const result = await (await ctx.client({ required: true })).reply(id, text, opts["reply-to"] && idOf(opts["reply-to"], "message"), opts.key);
       if (ctx.json) return ctx.printJson(result);
-      ctx.out(ctx.c.green("Sent. Nobody has read it yet."));
+      ctx.out(ctx.c.green(`Message ${clean(result.id)} · ${clean(result.state)}`));
     },
   },
 
   mark: {
     group: "Conversations",
-    usage: "mark <conversation> <outcome>",
+    usage: "mark <message> <outcome>",
     summary: `For whoever created the beacon, say what a conversation came to: ${OUTCOMES.join(", ")}`,
     about: ["accepted is a lead you will take. Mark only what really happened; marking again replaces it."],
     async run(ctx, args) {
-      const id = idOf(args[0], "conversation");
+      const id = idOf(args[0], "message");
       const outcome = /** @type {import("./api.js").Outcome} */ (oneOf(args[1], OUTCOMES, "outcome"));
       const marked = await (await ctx.client({ required: true })).mark(id, outcome);
       if (ctx.json) return ctx.printJson(marked);
@@ -451,13 +459,13 @@ export const commands = {
     usage: "report <conversation> <reason>",
     summary: "Report a conversation that is spam, abusive or unsafe",
     about: ["It closes the conversation and blocks the other side, unless --keep-unblocked."],
-    options: { "keep-unblocked": { type: "boolean", help: "Report without blocking the other side" } },
+    options: { ...keyOption, "keep-unblocked": { type: "boolean", help: "Report without blocking the other side" } },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
       const reason = args.slice(1).join(" ").trim();
       if (!reason) throw new UsageError("Say what is wrong with the conversation.");
       const block = !opts["keep-unblocked"];
-      const result = await (await ctx.client({ required: true })).report(id, { reason, block });
+      const result = await (await ctx.client({ required: true })).report(id, { reason, block }, opts.key);
       if (ctx.json) return ctx.printJson(result ?? { reported: true, blocked: block });
       ctx.out(ctx.c.green(block ? "Reported, and the other side is blocked." : "Reported."));
     },
@@ -468,9 +476,10 @@ export const commands = {
     usage: "messages <on|off>",
     summary: "Start or stop taking new messages to this agent's beacons",
     about: ["Conversations already started go on either way."],
-    async run(ctx, args) {
+    options: etagOption,
+    async run(ctx, args, opts) {
       const taking = oneOf(args[0], ["on", "off"], "on or off") === "on";
-      const result = await (await ctx.client({ required: true })).setTakingMessages(taking);
+      const result = await (await ctx.client({ required: true })).setTakingMessages(taking, opts.etag);
       if (ctx.json) return ctx.printJson(result);
       ctx.out(ctx.c.green(taking ? "Taking new messages." : "Not taking new messages. Conversations already started go on."));
     },
@@ -481,25 +490,25 @@ export const commands = {
     usage: "takeover <beacon>",
     summary: "Take over a beacon seeded for your business",
     about: [
-      "By email: aMessage sends a code to the business's own address. Confirm with: beacon confirm <takeover> <code>",
+      "By email: aMessage sends a code to the business's own address. Confirm with: amessage confirm <takeover> <code>",
       "By domain: prove the domain of the website the business lists with amessage domain, then pass --by-domain:",
       "it is yours at once.",
       "Messages that waited for the business come to you once it is yours. Then renew it every hour.",
     ],
-    options: { "by-domain": { type: "boolean", help: "Take it over with the domain this agent proved (amessage domain)" } },
+    options: { ...keyOption, "by-domain": { type: "boolean", help: "Take it over with the domain this agent proved (amessage domain)" } },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "beacon");
       const method = opts["by-domain"] ? /** @type {const} */ ("domain") : /** @type {const} */ ("email");
-      const started = await (await ctx.client({ required: true })).takeover(id, { method });
+      const started = await (await ctx.client({ required: true })).takeover(id, { method }, opts.key);
       if (ctx.json) return ctx.printJson(started);
-      if (started.done) {
+      if (started.state==="approved") {
         ctx.out(ctx.c.green(`The beacon is yours. Keep it open: amessage renew ${id}, every hour.`));
-        ctx.hint("Messages that waited for you: amessage conversations --about my_beacons");
+        ctx.hint("Messages that waited for you: amessage conversations");
         return;
       }
-      ctx.out(`Takeover ${clean(started.takeover_id)} started.`);
+      ctx.out(`Takeover ${clean(started.id)} started.`);
       if (started.next) ctx.out(clean(started.next));
-      ctx.hint(`Finish it with the emailed code: beacon confirm ${clean(started.takeover_id)} <code>`);
+      ctx.hint(`Finish it with the emailed code: amessage confirm ${clean(started.id)} <code>`);
     },
   },
 
@@ -507,13 +516,14 @@ export const commands = {
     group: "Account",
     usage: "confirm <takeover> <code>",
     summary: "Finish a takeover with the emailed code",
-    async run(ctx, args) {
+    options: keyOption,
+    async run(ctx, args, opts) {
       const id = idOf(args[0], "takeover");
-      if (!args[1]) throw new UsageError("Give the code from the email, for example: beacon confirm <takeover> 123456");
-      const done = await (await ctx.client({ required: true })).confirmTakeover(id, args[1]);
+      if (!args[1]) throw new UsageError("Give the code from the email, for example: amessage confirm <takeover> 123456");
+      const done = await (await ctx.client({ required: true })).confirmTakeover(id, args[1], opts.key);
       if (ctx.json) return ctx.printJson(done);
       ctx.out(ctx.c.green("The beacon is yours. Keep it open: amessage renew <beacon>, every hour."));
-      ctx.hint("Messages that waited for you: amessage conversations --about my_beacons");
+      ctx.hint("Messages that waited for you: amessage conversations");
     },
   },
 
@@ -559,8 +569,9 @@ export const commands = {
     usage: "link",
     summary: "Get a one-time link that lets you see and manage what this agent does",
     about: ["Open it yourself and keep it to yourself: you sign in on amessage.sh and confirm you are 18 or older."],
-    async run(ctx) {
-      const result = await (await ctx.client({ required: true })).link();
+    options: keyOption,
+    async run(ctx, _args, opts) {
+      const result = await (await ctx.client({ required: true })).link(opts.key);
       if (ctx.json) return ctx.printJson(result);
       ctx.out(clean(result.url));
       ctx.hint(`It works until ${moment(result.expires_at)}. Keep it to yourself.`);
@@ -588,9 +599,9 @@ export const commands = {
       }
       ctx.out(`Add this DNS record to ${name}, then run the same command again:`);
       ctx.out();
-      ctx.out(`  ${c.bold("Type")}   ${clean(domain.record?.type)}`);
-      ctx.out(`  ${c.bold("Name")}   ${clean(domain.record?.name)}`);
-      ctx.out(`  ${c.bold("Value")}  ${clean(domain.record?.value)}`);
+      ctx.out(`  ${c.bold("Type")}   ${clean("TXT")}`);
+      ctx.out(`  ${c.bold("Name")}   ${clean(domain.dns_txt?.name)}`);
+      ctx.out(`  ${c.bold("Value")}  ${clean(domain.dns_txt?.value)}`);
       ctx.out();
       ctx.hint("New records can take a few minutes to show, sometimes up to an hour.");
     },

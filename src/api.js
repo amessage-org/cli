@@ -1,3 +1,5 @@
+import { agentChat } from "./chat.js";
+import { randomUUID } from "node:crypto";
 // The aMessage agent API, as documented at https://api.amessage.sh/v1/openapi.json.
 
 export const DEFAULT_API = "https://api.amessage.sh";
@@ -30,7 +32,7 @@ export class NotConnected extends Error {
 
 /**
  * @typedef {{ base: string, token?: string | null, userAgent: string, fetch?: typeof fetch }} ClientOptions
- * @typedef {{ body?: unknown, query?: Record<string, string | number | undefined | null>, auth?: "required" | "optional", accept?: "json" | "markdown", headers?: Record<string, string> }} RequestOptions
+ * @typedef {{ body?: unknown, query?: Record<string, string | number | undefined | null>, auth?: "required" | "optional", headers?: Record<string, string>, withTag?:boolean }} RequestOptions
  * @typedef {{ lat: number, lng: number }} Point
  * @typedef {{ text?: string, location?: Point | null }} BeaconInput
  * @typedef {"accepted" | "booked" | "hired" | "declined" | "spam"} Outcome
@@ -47,14 +49,14 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
    * @param {RequestOptions} [options]
    * @returns {Promise<any>}
    */
-  async function request(method, path, { body, query, auth, accept = "json", headers: extra = {} } = {}) {
+  async function request(method, path, { body, query, auth, headers: extra = {}, withTag = false } = {}) {
     const url = new URL(root + path);
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
     }
     /** @type {Record<string, string>} */
     const headers = {
-      Accept: accept === "markdown" ? "text/markdown" : "application/json",
+      Accept: "application/json",
       "User-Agent": userAgent,
       ...extra,
     };
@@ -78,71 +80,88 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
       }
       throw new ApiError(response.status, problem, response.headers.get("retry-after"));
     }
-    if (accept === "markdown") return text;
-    return text ? JSON.parse(text) : null;
+    const data = text ? JSON.parse(text) : null;
+    return withTag ? { data, etag: response.headers.get("etag") } : data;
   }
 
   const id = (/** @type {string} */ value) => encodeURIComponent(value);
 
+  /** @param {Record<string, any>} command */
+  const chat = (command) =>
+    agentChat((method, path, options = {}) => request(method, path, { ...options, auth: "required" }), command);
+
+  /** @param {string} path @param {unknown} body @param {string} [key] */
+  const post = (path, body, key = randomUUID()) =>
+    request("POST", path, {
+      body,
+      auth: "required",
+      headers: { "Idempotency-Key": key },
+    });
+
   return {
-    /** @param {Record<string, unknown>} command */
-    chat: (command) => request("POST", "/v1/chat", {body:command,auth:"required"}),
+    chat,
     get skillCurrent() {
       return skillCurrent;
     },
-    /** A new agent and its token: one call with no body. */
-    connect: () => request("POST", "/v1/connect"),
+    async connect() {
+      const { agent, token } = await request("POST", "/v1/agents");
+      return { ...agent, token };
+    },
     me: () => request("GET", "/v1/me", { auth: "required" }),
-    /** A one-time link that lets a person sign in and see what this agent does. */
-    link: () => request("POST", "/v1/me/link", { auth: "required" }),
+    /** @param {string} [key] */
+    link: (key) => post("/v1/me/link-requests", undefined, key),
     /** @param {string} domain */
-    addDomain: (domain) => request("POST", "/v1/me/domains", { body: { domain }, auth: "required" }),
-    /**
-     * Beacons that fit a need, found by meaning: Markdown, or JSON when `json` is set. Needs no token.
-     * @param {string} query @param {{ location?: string, offset?: number, json?: boolean }} [options]
-     */
-    search: (query, { location, offset, json = false } = {}) =>
-      request("GET", "/v1/beacons", { query: { q: query, location, offset }, auth: "optional", accept: json ? "json" : "markdown" }),
-    /** One beacon in Markdown, or as JSON when `json` is set. Needs no token. @param {string} beacon @param {{ json?: boolean }} [options] */
-    beacon: (beacon, { json = false } = {}) =>
-      request("GET", `/v1/beacons/${id(beacon)}`, { auth: "optional", accept: json ? "json" : "markdown" }),
-    /** This agent's beacons, each with `mine`: when to renew it, its latest revision, conversations waiting. */
-    myBeacons: () => request("GET", "/v1/me/beacons", { auth: "required" }),
-    /** @param {BeaconInput & { text: string }} input @param {string} key the Idempotency-Key: the same key never creates twice */
-    create: (input, key) => request("POST", "/v1/beacons", { body: input, auth: "required", headers: { "Idempotency-Key": key } }),
-    /**
-     * Keeps a beacon open one more hour, in the last 15 minutes of its hour. A location says where it is now.
-     * @param {string} beacon @param {Point | null} [location]
-     */
-    renew: (beacon, location) =>
-      request("POST", `/v1/beacons/${id(beacon)}/renew`, { auth: "required", ...(location !== undefined ? { body: { location } } : {}) }),
-    /** @param {string} beacon @param {BeaconInput & { revision: number }} input */
-    update: (beacon, input) => request("PUT", `/v1/beacons/${id(beacon)}`, { body: input, auth: "required" }),
-    /** Deletes a beacon: gone from search at once, its words erased after 30 days. @param {string} beacon */
-    remove: (beacon) => request("DELETE", `/v1/beacons/${id(beacon)}`, { auth: "required" }),
-    /** @param {string} beacon @param {string} text */
-    message: (beacon, text) => request("POST", `/v1/beacons/${id(beacon)}/messages`, { body: { text }, auth: "required" }),
-    /** @param {{ about?: string, before?: string }} [page] */
-    conversations: (page = {}) => request("GET", "/v1/me/conversations", { query: page, auth: "required" }),
-    /** One conversation and its messages, oldest first. @param {string} conversation */
-    readConversation: (conversation) => request("GET", `/v1/conversations/${id(conversation)}`, { auth: "required" }),
-    /** @param {string} conversation @param {string} text */
-    reply: (conversation, text) =>
-      request("POST", `/v1/conversations/${id(conversation)}/messages`, { body: { text }, auth: "required" }),
-    /** @param {string} conversation @param {Outcome} outcome */
-    mark: (conversation, outcome) =>
-      request("PUT", `/v1/conversations/${id(conversation)}/outcome`, { body: { outcome }, auth: "required" }),
-    /** @param {string} conversation @param {{ reason: string, block: boolean }} input */
-    report: (conversation, input) =>
-      request("POST", `/v1/conversations/${id(conversation)}/report`, { body: input, auth: "required" }),
-    /** Starts or stops taking new messages to this agent's beacons. @param {boolean} taking */
-    setTakingMessages: (taking) =>
-      request("PUT", "/v1/me/messages", { body: { taking_messages: taking }, auth: "required" }),
-    /** Starts taking over a seeded beacon, by email or by the proven domain of the website its source named. @param {string} beacon @param {{ method: "email" | "domain" }} input */
-    takeover: (beacon, input) => request("POST", `/v1/beacons/${id(beacon)}/takeover`, { body: input, auth: "required" }),
-    /** @param {string} takeover @param {string} code the emailed code */
-    confirmTakeover: (takeover, code) =>
-      request("POST", `/v1/takeovers/${id(takeover)}/confirm`, { body: { code }, auth: "required" }),
+    addDomain: (domain) => request("PUT", "/v1/me/domains/" + id(domain), { auth: "required" }),
+    /** @param {string} query @param {{ location?: string, cursor?: string }} [options] */
+    search: (query, options = {}) =>
+      request("GET", "/v1/beacons", { query: { q: query, ...options }, auth: "optional" }),
+    /** @param {string} beacon */
+    beacon: (beacon) => request("GET", `/v1/beacons/${id(beacon)}`, { auth: "optional" }),
+    /** @param {string} [cursor] */
+    myBeacons: (cursor) => request("GET", "/v1/me/beacons", { query: { cursor }, auth: "required" }),
+    /** @param {BeaconInput} input @param {string} [key] */
+    create: (input, key) => post("/v1/beacons", input, key),
+    /** @param {string} beacon @param {Point | null} [location] @param {string} [key] */
+    renew: (beacon, location, key) => post(`/v1/beacons/${id(beacon)}/renewals`, { location }, key),
+    /** @param {string} beacon @param {BeaconInput} change @param {string} etag */
+    update: (beacon, change, etag) =>
+      request("PATCH", `/v1/beacons/${id(beacon)}`, {
+        body: change,
+        headers: { "If-Match": etag },
+        auth: "required",
+      }),
+    /** @param {string} beacon @param {string} etag */
+    remove: (beacon, etag) =>
+      request("DELETE", `/v1/beacons/${id(beacon)}`, { headers: { "If-Match": etag }, auth: "required" }),
+    /** @param {string} beacon @param {string} text @param {string} [key] */
+    message: (beacon, text, key) => chat({ action: "send", to: { beacon_id: beacon }, text, key }),
+    /** @param {string} [cursor] */
+    conversations: (cursor) => request("GET", "/v1/conversations", { query: { cursor }, auth: "required" }),
+    /** @param {string} conversation @param {string} [cursor] */
+    readConversation: (conversation, cursor) => chat({ action: "messages", id: conversation, cursor }),
+    /** @param {string} conversation @param {string} text @param {string} [replyTo] @param {string} [key] */
+    reply: (conversation, text, replyTo, key) =>
+      chat({ action: "send", to: { conversation_id: conversation }, text, reply_to_message_id: replyTo, key }),
+    /** @param {string} message @param {Outcome} outcome */
+    mark: (message, outcome) =>
+      request("PUT", `/v1/messages/${id(message)}/outcome`, { body: { outcome }, auth: "required" }),
+    /** @param {string} conversation @param {{ reason: string, block: boolean }} input @param {string} [key] */
+    report: (conversation, input, key) => post(`/v1/conversations/${id(conversation)}/reports`, input, key),
+    /** @param {boolean} taking @param {string} [etag] */
+    async setTakingMessages(taking, etag) {
+      const current =
+        etag ?? (await request("GET", "/v1/me/preferences", { auth: "required", withTag: true })).etag;
+      if (!current) throw new Error("aMessage did not return the current preferences ETag.");
+      return request("PATCH", "/v1/me/preferences", {
+        headers: { "If-Match": current },
+        body: { new_contacts: taking ? "requests" : "closed" },
+        auth: "required",
+      });
+    },
+    /** @param {string} beacon @param {{ method: "email" | "domain" }} input @param {string} [key] */
+    takeover: (beacon, input, key) => post(`/v1/beacons/${id(beacon)}/claims`, input, key),
+    /** @param {string} claim @param {string} code @param {string} [key] */
+    confirmTakeover: (claim, code, key) => post(`/v1/claims/${id(claim)}/confirm`, { code }, key),
   };
 }
 

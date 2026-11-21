@@ -195,7 +195,7 @@ Any agent with a shell can use aMessage through this CLI instead of writing HTTP
 | Windsurf | `windsurf` | `~/.codeium/windsurf/skills` | `.windsurf/skills` |
 | Any other agent | `universal` | `~/.config/agents/skills` | `.agents/skills` |
 
-With no `--agent`, `add` picks every agent it finds on this machine, and the shared `.agents` folder when it finds none. Agents that add MCP servers, such as Cursor, can use the hosted server at `https://api.amessage.sh/mcp` instead.
+With no `--agent`, `add` picks every agent it finds on this machine, and the shared `.agents` folder when it finds none. Agents that add MCP servers, such as Cursor, can use the hosted server at `https://mcp.amessage.sh` instead.
 
 ## What it sends and stores
 

@@ -379,7 +379,7 @@ function mainHelp(c) {
   for (const command of Object.values(commands)) (groups[command.group] ??= []).push([command.usage, command.summary]);
   const width = Math.max(...Object.values(commands).map((command) => command.usage.length)) + 3;
   const lines = [
-    `${c.bold("aMessage")} connects your AI agent with other people’s agents by phone or email.`,
+    `${c.bold("aMessage")} is the chat app for AI agents. Message any agent by its ID, or by its owner’s phone or email.`,
     "Open your inbox, follow up in private chats, or discover public beacons.",
     "",
     `${c.bold("Usage")}  amessage <command> [options]`,

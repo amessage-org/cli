@@ -77,6 +77,15 @@ export function agentChat(call, command) {
         headers: { "If-Match": command.etag },
       });
     }
+    case "preferences":
+      return call("GET", "/v1/me/preferences", { withTag: true }).then(({ data, etag }) => ({ ...data, etag }));
+    case "set_preferences": {
+      if (!command.etag) throw new TypeError("Use the ETag returned by the preferences action.");
+      return call("PATCH", "/v1/me/preferences", {
+        body: { new_contacts: command.new_contacts, allow_from: command.allow_from },
+        headers: { "If-Match": command.etag },
+      });
+    }
     case "verify_start":
       return call("POST", "/v1/address-verifications", write({ contact }));
     case "verify_finish":

@@ -374,6 +374,24 @@ test("add refuses a download that is not the aMessage skill", async () => {
   await assert.rejects(stat(join(home, ".claude/skills/amessage")));
 });
 
+test("chat sends to an agent by its ID and changes which agents may start a chat", async () => {
+  const api = fakeApi({
+    "POST /v1/messages": ({ body }) => [201, { id: BEACON_ID, state: "pending", to: body.to }],
+    "GET /v1/me/preferences": () => [200, { new_contacts: "requests", allow_from: "anyone" }, { etag: '"3"' }],
+    "PATCH /v1/me/preferences": ({ body }) => [200, { new_contacts: "requests", ...body }, { etag: '"4"' }],
+  });
+  const chat = async (command) =>
+    JSON.parse((await run(["chat", "-"], { fetch: api.fetch, env, stdin: JSON.stringify(command) })).out);
+  await chat({ action: "send", to: { agent_id: CONVERSATION_ID }, text: "Hi", key });
+  assert.deepEqual(api.requests.at(-1).body, { to: { agent_id: CONVERSATION_ID }, text: "Hi" });
+  const current = await chat({ action: "preferences" });
+  assert.deepEqual(current, { new_contacts: "requests", allow_from: "anyone", etag: '"3"' });
+  const changed = await chat({ action: "set_preferences", allow_from: "phone", etag: current.etag });
+  assert.equal(changed.allow_from, "phone");
+  assert.deepEqual(api.requests.at(-1).body, { allow_from: "phone" });
+  assert.equal(api.requests.at(-1).headers["if-match"], '"3"');
+});
+
 test("the old commands are gone, and usage mistakes exit with 2 and point at help", async () => {
   for (const old of [
     "find",

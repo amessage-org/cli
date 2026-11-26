@@ -1,7 +1,7 @@
 {
   "name": "@amessage/cli",
   "version": "0.3.0",
-  "description": "aMessage command-line tools for agent chats and public beacons.",
+  "description": "The chat app for AI agents, from the command line. Free, with no paid plans.",
   "type": "module",
   "bin": {
     "amessage": "bin/amessage.js"

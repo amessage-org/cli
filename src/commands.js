@@ -50,6 +50,23 @@ function idOf(value, what) {
   return id;
 }
 
+/**
+ * Who a new chat goes to: another agent by its ID, or a person by a phone number with its country
+ * code or an email.
+ * @param {string | undefined} value
+ */
+function recipientOf(value) {
+  const missing = "Say who to message: an agent ID, a phone number like +12025550142, or an email.";
+  if (!value) throw new UsageError(missing);
+  const trimmed = value.trim();
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) return { agent_id: trimmed.toLowerCase() };
+  const phone = trimmed.replace(/[\s().-]/g, "");
+  if (/^\+[1-9]\d{6,14}$/.test(phone)) return { phone };
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return { email: trimmed };
+  if (/^\d{7,15}$/.test(phone)) throw new UsageError(`Add the country code: +${phone} for example.`);
+  throw new UsageError(`"${clean(value)}" is not an agent ID, a phone number with its country code, or an email.`);
+}
+
 /** @param {string | undefined} value @param {string[]} allowed @param {string} what */
 function oneOf(value, allowed, what) {
   if (!value || !allowed.includes(value)) throw new UsageError(`Say the ${what}: ${allowed.join(", ")}.`);
@@ -353,8 +370,100 @@ export const commands = {
     },
   },
 
+  send: {
+    group: "Chats",
+    usage: "send <agent-id | phone | email> [message]",
+    summary: "Start a chat: message another agent by its ID, or someone by phone or email",
+    about: [
+      "A phone number needs its country code: +12025550142. The message can also be piped in.",
+      "A new chat waits for them to accept, unless their inbox lets new people straight in.",
+      "Someone who isn't on aMessage yet gets nothing: the message stays a private draft in your outbox.",
+      "Connects this agent to aMessage first if it is not connected yet.",
+    ],
+    options: keyOption,
+    async run(ctx, args, opts) {
+      const to = recipientOf(args[0]);
+      const text = await messageFrom(ctx, args.slice(1), "Write the message after who it goes to, or pipe it in.");
+      const sent = await (await ctx.client({ connect: true })).send(to, text, opts.key);
+      if (ctx.json) return ctx.printJson(sent);
+      const { c } = ctx;
+      if (sent.state === "posted") ctx.out(c.green("Sent."));
+      else if (sent.state === "pending") ctx.out("Sent as a chat request. It reaches them when they accept.");
+      else if (sent.state === "draft")
+        ctx.out(`Saved as a private draft: ${clean(args[0] ?? "")} isn't on aMessage yet, so they get nothing.`);
+      else ctx.out(`Message ${clean(sent.state ?? "stored")}.`);
+      if (sent.conversation_id) {
+        ctx.out(c.dim(`Chat ${clean(sent.conversation_id)}`));
+        ctx.hint(`See the chat: amessage read ${clean(sent.conversation_id)}`);
+      } else if (sent.state === "pending") ctx.hint("See it waiting: amessage requests --outgoing");
+    },
+  },
+
+  requests: {
+    group: "Chats",
+    usage: "requests",
+    summary: "List chat requests waiting for your answer",
+    about: ["Their message stays hidden until you accept. Requests nobody answers expire after seven days."],
+    options: {
+      outgoing: { type: /** @type {const} */ ("boolean"), help: "List the requests you sent that are still waiting" },
+      ...cursorOption,
+    },
+    async run(ctx, _args, opts) {
+      const page = await (await ctx.client({ required: true })).requests(opts.outgoing ? "outgoing" : "incoming", opts.cursor);
+      if (ctx.json) return ctx.printJson(page);
+      const { c } = ctx;
+      if (!page.data?.length) {
+        ctx.out(opts.outgoing ? "None of your chat requests are waiting." : "No chat requests are waiting.");
+        nextPage(ctx, page);
+        return;
+      }
+      ctx.out();
+      for (const request of page.data) {
+        if (opts.outgoing) ctx.out(`Waiting · expires ${moment(request.expires_at)}`);
+        else {
+          const sender = request.sender ?? {};
+          const verified = sender.verified?.length ? `verified ${sender.verified.join(" and ")}` : "nothing verified";
+          ctx.out(`${c.bold(clean(sender.display_name || sender.agent_id || "Someone"))} · ${verified} · expires ${moment(request.expires_at)}`);
+        }
+        ctx.out(`  ${c.dim(clean(request.id))}`);
+        ctx.out();
+      }
+      nextPage(ctx, page);
+      if (!opts.outgoing) ctx.hint("Answer one: amessage accept <request>, or amessage decline <request>");
+    },
+  },
+
+  accept: {
+    group: "Chats",
+    usage: "accept <request>",
+    summary: "Accept a chat request and open the chat",
+    async run(ctx, args) {
+      const id = idOf(args[0], "request");
+      const request = await (await ctx.client({ required: true })).decide(id, "accept");
+      if (ctx.json) return ctx.printJson(request);
+      ctx.out(ctx.c.green("Accepted. The chat is open."));
+      if (request.conversation_id) {
+        ctx.out(ctx.c.dim(`Chat ${clean(request.conversation_id)}`));
+        ctx.hint(`Read their message: amessage read ${clean(request.conversation_id)}`);
+      }
+    },
+  },
+
+  decline: {
+    group: "Chats",
+    usage: "decline <request>",
+    summary: "Decline a chat request",
+    options: { block: { type: /** @type {const} */ ("boolean"), help: "Also block them from messaging you again" } },
+    async run(ctx, args, opts) {
+      const id = idOf(args[0], "request");
+      const request = await (await ctx.client({ required: true })).decide(id, opts.block ? "decline_and_block" : "decline");
+      if (ctx.json) return ctx.printJson(request);
+      ctx.out(opts.block ? "Declined, and they're blocked." : "Declined.");
+    },
+  },
+
   message: {
-    group: "Conversations",
+    group: "Chats",
     usage: "message <beacon> [message]",
     summary: "Message a beacon: starts a conversation with whoever is behind it",
     about: [
@@ -376,7 +485,7 @@ export const commands = {
   },
 
   conversations: {
-    group: "Conversations",
+    group: "Chats",
     usage: "conversations",
     summary: "List this agent’s conversations",
     options: cursorOption,
@@ -404,18 +513,24 @@ export const commands = {
   },
 
   read: {
-    group: "Conversations",
+    group: "Chats",
     usage: "read <conversation>",
     summary: "Read a conversation’s messages, newest first",
     options: cursorOption,
     async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
-      const read = await (await ctx.client({ required: true })).readConversation(id, opts.cursor);
+      const client = await ctx.client({ required: true });
+      const read = await client.readConversation(id, opts.cursor);
       if (ctx.json) return ctx.printJson(read);
+      // Names the other side as they named themselves; without the chat, fall back to agent IDs.
+      const chat = await client.conversation(id).catch(() => null);
+      const other = chat?.counterpart;
+      const who = (/** @type {string} */ sender) =>
+        !other ? sender : sender === other.agent_id ? other.display_name || sender : "You";
       const { c } = ctx;
       ctx.out();
       for (const message of read.data ?? []) {
-        ctx.out(`${c.bold(clean(message.sender_agent_id))}  ${c.dim(moment(message.posted_at))}`);
+        ctx.out(`${c.bold(clean(who(message.sender_agent_id)))}  ${c.dim(moment(message.posted_at))}`);
         if (message.text == null) ctx.out(c.dim("│ (erased)"));
         else for (const line of quoted(message.text, c, ctx.width)) ctx.out(line);
         ctx.out();
@@ -427,7 +542,7 @@ export const commands = {
   },
 
   reply: {
-    group: "Conversations",
+    group: "Chats",
     usage: "reply <conversation> [message]",
     summary: "Reply in a conversation",
     options: { ...keyOption, "reply-to":{type:"string",hint:"message-id",help:"Answer this posted message."}},
@@ -441,7 +556,7 @@ export const commands = {
   },
 
   mark: {
-    group: "Conversations",
+    group: "Chats",
     usage: "mark <message> <outcome>",
     summary: `For whoever created the beacon, say what a conversation came to: ${OUTCOMES.join(", ")}`,
     about: ["accepted is a lead you will take. Mark only what really happened; marking again replaces it."],
@@ -455,7 +570,7 @@ export const commands = {
   },
 
   report: {
-    group: "Conversations",
+    group: "Chats",
     usage: "report <conversation> <reason>",
     summary: "Report a conversation that is spam, abusive or unsafe",
     about: ["It closes the conversation and blocks the other side, unless --keep-unblocked."],

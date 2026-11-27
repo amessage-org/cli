@@ -413,12 +413,99 @@ test("chat sends to an agent by its ID and changes which agents may start a chat
   assert.equal(api.requests.at(-1).headers["if-match"], '"3"');
 });
 
+test("send starts a chat with an agent ID, a phone or an email, and says what happened", async () => {
+  const AGENT = "47f77742-b8d1-4de8-a163-f4558c9abedd";
+  const api = fakeApi({
+    "POST /v1/messages": ({ body }) =>
+      body.to.agent_id
+        ? [201, { id: BEACON_ID, state: "posted", conversation_id: CONVERSATION_ID }]
+        : body.to.phone
+          ? [201, { id: BEACON_ID, state: "pending", request_id: CONVERSATION_ID, conversation_id: null }]
+          : [201, { id: BEACON_ID, state: "draft", request_id: CONVERSATION_ID, conversation_id: null }],
+  });
+  const send = (/** @type {string[]} */ argv) => run(["send", ...argv], { fetch: api.fetch, env });
+  const posted = await send([AGENT.toUpperCase(), "Can", "you", "check", "the", "build?"]);
+  assert.equal(posted.code, 0, posted.err);
+  assert.deepEqual(api.requests.at(-1).body, { to: { agent_id: AGENT }, text: "Can you check the build?" });
+  assert.match(posted.out, /Sent\./);
+  assert.match(posted.err + posted.out, /amessage read/);
+  const pending = await send(["+1 (202) 555-0142", "Free Friday?", "--key", key]);
+  assert.deepEqual(api.requests.at(-1).body.to, { phone: "+12025550142" });
+  assert.equal(api.requests.at(-1).headers["idempotency-key"], key);
+  assert.match(pending.out, /chat request/);
+  const draft = await send(["alex@example.com", "Hello"]);
+  assert.deepEqual(api.requests.at(-1).body.to, { email: "alex@example.com" });
+  assert.match(draft.out, /private draft/);
+  const sent = api.requests.length;
+  for (const argv of [[], ["2025550142", "Hi"], ["alex", "Hi"], [AGENT]]) {
+    const refused = await send(argv);
+    assert.equal(refused.code, 2, argv.join(" "));
+  }
+  assert.match((await send(["2025550142", "Hi"])).err, /country code/);
+  assert.equal(api.requests.length, sent);
+});
+
+test("requests, accept and decline answer chat requests without JSON", async () => {
+  const pending = {
+    id: CONVERSATION_ID,
+    state: "pending",
+    direction: "incoming",
+    sender: { agent_id: "a1", display_name: "Build bot", verified: ["phone"] },
+    expires_at: "2026-12-04T09:00:00Z",
+    conversation_id: null,
+  };
+  const api = fakeApi({
+    "GET /v1/requests": ({ url }) => [200, { data: url.searchParams.get("direction") === "incoming" ? [pending] : [], next_cursor: null }],
+    [`PUT /v1/requests/${CONVERSATION_ID}/decision`]: ({ body }) => [
+      200,
+      { ...pending, state: body.decision === "accept" ? "accepted" : "declined", conversation_id: body.decision === "accept" ? BEACON_ID : null },
+    ],
+  });
+  const cli = (/** @type {string[]} */ argv) => run(argv, { fetch: api.fetch, env });
+  const list = await cli(["requests"]);
+  assert.equal(list.code, 0, list.err);
+  assert.match(list.out, /Build bot · verified phone/);
+  assert.equal(api.requests.at(-1).url.searchParams.get("state"), "pending");
+  assert.match((await cli(["requests", "--outgoing"])).out, /None of your chat requests are waiting/);
+  const accepted = await cli(["accept", CONVERSATION_ID]);
+  assert.deepEqual(api.requests.at(-1).body, { decision: "accept" });
+  assert.match(accepted.out, /The chat is open/);
+  assert.match(accepted.out + accepted.err, new RegExp(`amessage read ${BEACON_ID}`));
+  await cli(["decline", CONVERSATION_ID, "--block"]);
+  assert.deepEqual(api.requests.at(-1).body, { decision: "decline_and_block" });
+  await cli(["decline", CONVERSATION_ID]);
+  assert.deepEqual(api.requests.at(-1).body, { decision: "decline" });
+});
+
+test("read names the other side and you, instead of agent IDs", async () => {
+  const api = fakeApi({
+    [`GET /v1/conversations/${CONVERSATION_ID}`]: () => [
+      200,
+      { id: CONVERSATION_ID, counterpart: { agent_id: "them", display_name: "Build bot", verified: [] } },
+    ],
+    [`GET /v1/conversations/${CONVERSATION_ID}/messages`]: () => [
+      200,
+      {
+        data: [
+          { sender_agent_id: "them", text: "Done.", posted_at: "2026-11-27T09:01:00Z" },
+          { sender_agent_id: "me", text: "Check the build?", posted_at: "2026-11-27T09:00:00Z" },
+        ],
+        next_cursor: null,
+      },
+    ],
+  });
+  const read = await run(["read", CONVERSATION_ID], { fetch: api.fetch, env });
+  assert.equal(read.code, 0, read.err);
+  assert.match(read.out, /Build bot/);
+  assert.match(read.out, /You/);
+  assert.doesNotMatch(read.out, /^(them|me) /m);
+});
+
 test("the old commands are gone, and usage mistakes exit with 2 and point at help", async () => {
   for (const old of [
     "find",
     "post",
     "listings",
-    "send",
     "inbox",
     "end",
     "on",

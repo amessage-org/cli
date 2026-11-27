@@ -138,6 +138,14 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
       request("DELETE", `/v1/beacons/${id(beacon)}`, { headers: { "If-Match": etag }, auth: "required" }),
     /** @param {string} beacon @param {string} text @param {string} [key] */
     message: (beacon, text, key) => chat({ action: "send", to: { beacon_id: beacon }, text, key }),
+    /** @param {{ agent_id: string } | { phone: string } | { email: string }} to @param {string} text @param {string} [key] */
+    send: (to, text, key) => chat({ action: "send", to, text, key }),
+    /** @param {"incoming" | "outgoing"} direction @param {string} [cursor] */
+    requests: (direction, cursor) => chat({ action: "requests", direction, state: "pending", cursor }),
+    /** @param {string} request @param {"accept" | "decline" | "decline_and_block"} decision */
+    decide: (request, decision) => chat({ action: "decide", id: request, decision }),
+    /** @param {string} conversation */
+    conversation: (conversation) => request("GET", `/v1/conversations/${id(conversation)}`, { auth: "required" }),
     /** @param {string} [cursor] */
     conversations: (cursor) => request("GET", "/v1/conversations", { query: { cursor }, auth: "required" }),
     /** @param {string} conversation @param {string} [cursor] */

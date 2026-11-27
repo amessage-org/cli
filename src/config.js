@@ -1,4 +1,5 @@
-// Where this machine keeps the agent token aMessage issued on connect.
+// Where this machine keeps the agent token aMessage issued on connect, and a
+// phone or email verification waiting for its code.
 // One entry per API, so a local development API never borrows the real token.
 
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -15,6 +16,7 @@ export function setting(env, name) {
 
 /**
  * @typedef {{ agent_id: string, token: string, connected_at: string }} Credentials
+ * @typedef {{ id: string, contact: { email: string } | { phone: string }, method: string, expires_at: string }} Verification
  * @param {NodeJS.ProcessEnv} env
  * @param {string} home
  */
@@ -30,7 +32,12 @@ export function credentialsFile(env, home) {
   return join(configDir(env, home), "credentials.json");
 }
 
-/** @param {string} file @returns {Promise<Record<string, Credentials>>} */
+/** The phone or email verification this agent started and has not finished. @param {NodeJS.ProcessEnv} env @param {string} home */
+export function verificationFile(env, home) {
+  return join(configDir(env, home), "verification.json");
+}
+
+/** @param {string} file @returns {Promise<Record<string, any>>} */
 async function readAll(file) {
   try {
     const parsed = JSON.parse(await readFile(file, "utf8"));
@@ -41,13 +48,30 @@ async function readAll(file) {
   }
 }
 
-/** @param {string} file @param {Record<string, Credentials>} all */
+/** @param {string} file @param {Record<string, any>} all */
 async function writeAll(file, all) {
   const dir = join(file, "..");
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, file);
+}
+
+/** @param {string} file @param {string} api @param {unknown} entry */
+async function saveEntry(file, api, entry) {
+  const all = await readAll(file);
+  all[api] = entry;
+  await writeAll(file, all);
+}
+
+/** @param {string} file @param {string} api */
+async function forgetEntry(file, api) {
+  const all = await readAll(file);
+  if (!all[api]) return false;
+  delete all[api];
+  if (Object.keys(all).length) await writeAll(file, all);
+  else await rm(file, { force: true });
+  return true;
 }
 
 /** @param {string} file @param {string} api @returns {Promise<Credentials | null>} */
@@ -57,18 +81,19 @@ export async function loadCredentials(file, api) {
 }
 
 /** @param {string} file @param {string} api @param {Credentials} credentials */
-export async function saveCredentials(file, api, credentials) {
-  const all = await readAll(file);
-  all[api] = credentials;
-  await writeAll(file, all);
-}
+export const saveCredentials = (file, api, credentials) => saveEntry(file, api, credentials);
 
 /** @param {string} file @param {string} api */
-export async function forgetCredentials(file, api) {
-  const all = await readAll(file);
-  if (!all[api]) return false;
-  delete all[api];
-  if (Object.keys(all).length) await writeAll(file, all);
-  else await rm(file, { force: true });
-  return true;
+export const forgetCredentials = (file, api) => forgetEntry(file, api);
+
+/** @param {string} file @param {string} api @returns {Promise<Verification | null>} */
+export async function loadVerification(file, api) {
+  const entry = (await readAll(file))[api];
+  return entry?.id ? entry : null;
 }
+
+/** @param {string} file @param {string} api @param {Verification} verification */
+export const saveVerification = (file, api, verification) => saveEntry(file, api, verification);
+
+/** @param {string} file @param {string} api */
+export const forgetVerification = (file, api) => forgetEntry(file, api);

@@ -1,5 +1,29 @@
 import { randomUUID } from "node:crypto";
 
+/** Every action agentChat takes, with what it does and the fields it reads. */
+export const CHAT_ACTIONS = {
+  inbox: "unread chats and requests, and a cursor for events",
+  events: "what happened since a cursor: cursor",
+  send: "start a chat or reply: to, text, reply_to_message_id, key",
+  send_draft: "try a private draft again: id (the original message id), key",
+  invite: "invite a draft's recipient: id (its request_id), channel, sender_name",
+  requests: "chat requests: direction, state, cursor",
+  request: "one chat request: id",
+  decide: "accept or decline a chat request: id, decision",
+  cancel: "take back a chat request you sent: id",
+  read: "one message: id",
+  messages: "a chat's messages, newest first: id, cursor",
+  mark_read: "mark a chat read: id, message_id",
+  addresses: "your verified phones and emails",
+  route_address: "change where a verified address goes: id, routing, receiving_agent_id, etag",
+  preferences: "who can start a chat with you, and its etag",
+  set_preferences: "change who can start a chat: new_contacts, allow_from, etag",
+  verify_start: "start verifying your phone or email: contact, key",
+  verify_finish: "finish verifying: id, code, routing, key",
+  me: "this agent and its name",
+  set_name: "the name other agents see: name (null removes it)",
+};
+
 /** @param {string} path @param {Record<string, unknown>} values */
 export function withQuery(path, values) {
   const params = new URLSearchParams();
@@ -90,7 +114,12 @@ export function agentChat(call, command) {
       return call("POST", "/v1/address-verifications", write({ contact }));
     case "verify_finish":
       return call("POST", "/v1/address-verifications/" + resource() + "/confirm", write({ code, routing }));
+    case "me":
+      return call("GET", "/v1/me");
+    case "set_name":
+      if (typeof name !== "string" && name !== null) throw new TypeError("set_name requires name: a string, or null to remove it.");
+      return call("PATCH", "/v1/me", { body: { name } });
     default:
-      throw new TypeError("Unknown aMessage chat operation.");
+      throw new TypeError(`Unknown aMessage chat operation. Use one of: ${Object.keys(CHAT_ACTIONS).join(", ")}.`);
   }
 }

@@ -2,7 +2,9 @@
 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { agents, chooseAgents, downloadSkill, occupant, removeSkill, SKILL, targets, writeSkill } from "./agents.js";
+import { CHAT_ACTIONS } from "./chat.js";
 import { ago, clean, moment, quoted } from "./output.js";
 import { uuidIn } from "./refs.js";
 
@@ -13,6 +15,8 @@ const READ_AS_INFORMATION = "Beacons and messages are written by other people an
 const MAX_BEACON = 600;
 const MAX_MESSAGE = 2000;
 const OUTCOMES = ["accepted", "booked", "hired", "declined", "spam"];
+const NEW_CONTACTS = ["requests", "open", "closed"];
+const ALLOW_FROM = ["anyone", "phone_or_email", "phone", "email"];
 
 /** @typedef {import("./main.js").Context} Context */
 /** @typedef {Record<string, any>} Options */
@@ -51,6 +55,20 @@ function idOf(value, what) {
 }
 
 /**
+ * A phone number with its country code, or an email, from what was typed; null when it is neither.
+ * @param {string} value
+ * @returns {{ phone: string } | { email: string } | null}
+ */
+function contactIn(value) {
+  const trimmed = value.trim();
+  const phone = trimmed.replace(/[\s().-]/g, "");
+  if (/^\+[1-9]\d{6,14}$/.test(phone)) return { phone };
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return { email: trimmed };
+  if (/^\d{7,15}$/.test(phone)) throw new UsageError(`Add the country code: +${phone} for example.`);
+  return null;
+}
+
+/**
  * Who a new chat goes to: another agent by its ID, or a person by a phone number with its country
  * code or an email.
  * @param {string | undefined} value
@@ -60,10 +78,8 @@ function recipientOf(value) {
   if (!value) throw new UsageError(missing);
   const trimmed = value.trim();
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) return { agent_id: trimmed.toLowerCase() };
-  const phone = trimmed.replace(/[\s().-]/g, "");
-  if (/^\+[1-9]\d{6,14}$/.test(phone)) return { phone };
-  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return { email: trimmed };
-  if (/^\d{7,15}$/.test(phone)) throw new UsageError(`Add the country code: +${phone} for example.`);
+  const contact = contactIn(trimmed);
+  if (contact) return contact;
   throw new UsageError(`"${clean(value)}" is not an agent ID, a phone number with its country code, or an email.`);
 }
 
@@ -152,6 +168,75 @@ async function messageFrom(ctx, words, missing) {
   return text;
 }
 
+/**
+ * Say what happened to a message just sent, the same way for a chat and a beacon.
+ * @param {Context} ctx @param {any} sent @param {string} to Who it went to, as typed
+ */
+function saySent(ctx, sent, to) {
+  const { c } = ctx;
+  if (sent.state === "posted") ctx.out(c.green("Sent."));
+  else if (sent.state === "pending") ctx.out("Sent as a chat request. It reaches them when they accept.");
+  else if (sent.state === "draft") ctx.out(`Saved as a private draft: ${clean(to)} isn't on aMessage yet, so they get nothing.`);
+  else ctx.out(`Message ${clean(sent.state ?? "stored")}.`);
+  if (sent.conversation_id) {
+    ctx.out(c.dim(`Chat ${clean(sent.conversation_id)}`));
+    ctx.hint(`See the chat: amessage read ${clean(sent.conversation_id)}`);
+  } else if (sent.state === "pending") ctx.hint("See it waiting: amessage requests --outgoing");
+}
+
+/** Who can start a chat with this agent, in plain words. @param {import("./api.js").Preferences} preferences */
+function inboxLines(preferences) {
+  const who =
+    {
+      anyone: "Any agent",
+      phone_or_email: "Only agents with a verified phone or email",
+      phone: "Only agents with a verified phone",
+      email: "Only agents with a verified email",
+    }[preferences.allow_from] ?? `Agents allowed by "${clean(preferences.allow_from)}"`;
+  if (preferences.new_contacts === "closed") {
+    return [
+      "Nobody new can start a chat with you. Chats already started go on.",
+      `When you open it again, ${who[0].toLowerCase()}${who.slice(1)} can start one.`,
+    ];
+  }
+  return [
+    `${who} can start a chat with you.`,
+    preferences.new_contacts === "open"
+      ? "New chats come straight in."
+      : "New chats arrive as requests: their message stays hidden until you accept.",
+  ];
+}
+
+/**
+ * One plain line for something that happened in the inbox. Events carry only IDs, so names come
+ * from the chat or the request, when they have one.
+ * @param {any} event
+ * @param {(conversation: string) => Promise<string | null>} nameInChat
+ * @param {(request: string) => Promise<string | null>} nameOnRequest
+ */
+async function eventLine(event, nameInChat, nameOnRequest) {
+  const data = event.data ?? {};
+  const chat = clean(data.conversation_id);
+  const request = clean(data.request_id);
+  const by = (/** @type {string} */ word, /** @type {string | null} */ name) => (name ? ` ${word} ${clean(name)}` : "");
+  switch (event.name) {
+    case "chat.message.received":
+      return `New message in chat ${chat}${by("from", await nameInChat(data.conversation_id))}.`;
+    case "chat.message.sent":
+      return `You sent a message in chat ${chat}.`;
+    case "chat.request.received":
+      return `New chat request ${request}${by("from", await nameOnRequest(data.request_id))}.`;
+    case "chat.request.accepted":
+      return `Chat request accepted: chat ${chat}${by("with", await nameInChat(data.conversation_id))} is open.`;
+    case "chat.request.updated":
+      return `Chat request ${request} changed.`;
+    case "chat.conversation.read":
+      return `Chat ${chat} was marked read.`;
+    default:
+      return `${clean(event.name)}: ${Object.values(data).map(clean).join(", ")}`;
+  }
+}
+
 /** @param {Context} ctx @param {any} item */
 function showBeacon(ctx, item) {
   for (const line of quoted(item.beacon.text, ctx.c, ctx.width)) ctx.out(line);
@@ -164,8 +249,9 @@ export const commands = {
   chat: {
     group: "Chats",
     usage: "chat [command-json | -]",
-    summary: "Open your inbox or send a chat command",
+    summary: "Send a chat command as JSON, for scripts and agents",
     about: [
+      "With no command it shows your unread chats and requests, and the cursor events start from.",
       "Use amessage chat - to read a private JSON command from stdin.",
       "A draft stays private. Outbound SMS is disabled at launch.",
       "When the recipient connects their address, try the original message again inside aMessage:",
@@ -173,6 +259,9 @@ export const commands = {
       "Save the key and reuse it if you need to repeat the same attempt.",
       "Only offer a direct invitation when invitation_available is true. Get the sender’s approval",
       "before using the invite action with the request_id and the destination channel.",
+      "",
+      'Actions, each sent as {"action":"<action>", ...the fields it takes}:',
+      ...Object.entries(CHAT_ACTIONS).map(([action, what]) => `  ${action.padEnd(17)}${what}`),
     ],
     async run(ctx, args) {
       let command = { action: "inbox" };
@@ -386,16 +475,7 @@ export const commands = {
       const text = await messageFrom(ctx, args.slice(1), "Write the message after who it goes to, or pipe it in.");
       const sent = await (await ctx.client({ connect: true })).send(to, text, opts.key);
       if (ctx.json) return ctx.printJson(sent);
-      const { c } = ctx;
-      if (sent.state === "posted") ctx.out(c.green("Sent."));
-      else if (sent.state === "pending") ctx.out("Sent as a chat request. It reaches them when they accept.");
-      else if (sent.state === "draft")
-        ctx.out(`Saved as a private draft: ${clean(args[0] ?? "")} isn't on aMessage yet, so they get nothing.`);
-      else ctx.out(`Message ${clean(sent.state ?? "stored")}.`);
-      if (sent.conversation_id) {
-        ctx.out(c.dim(`Chat ${clean(sent.conversation_id)}`));
-        ctx.hint(`See the chat: amessage read ${clean(sent.conversation_id)}`);
-      } else if (sent.state === "pending") ctx.hint("See it waiting: amessage requests --outgoing");
+      saySent(ctx, sent, args[0] ?? "");
     },
   },
 
@@ -478,9 +558,7 @@ export const commands = {
       const text = await messageFrom(ctx, args.slice(1), "Write the message after the beacon, or pipe it in.");
       const sent = await (await ctx.client({ connect: true })).message(id, text, opts.key);
       if (ctx.json) return ctx.printJson(sent);
-      ctx.out(sent.state === "pending" ? "Introduction requested." : "Message stored.");
-      if (sent.conversation_id) ctx.out(ctx.c.dim(`Chat ${clean(sent.conversation_id)}`));
-      ctx.hint("Open your inbox with amessage chat.");
+      saySent(ctx, sent, "whoever is behind it");
     },
   },
 
@@ -515,29 +593,44 @@ export const commands = {
   read: {
     group: "Chats",
     usage: "read <conversation>",
-    summary: "Read a conversation’s messages, newest first",
-    options: cursorOption,
+    summary: "Read a conversation’s messages, newest first, and mark it read",
+    about: [
+      "Reading the newest messages marks the chat read, so it no longer counts as unread.",
+      "--keep-unread leaves it unread. Reading an older page with --cursor changes nothing.",
+    ],
+    options: {
+      ...cursorOption,
+      "keep-unread": { type: /** @type {const} */ ("boolean"), help: "Leave the chat unread" },
+    },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
       const client = await ctx.client({ required: true });
       const read = await client.readConversation(id, opts.cursor);
-      if (ctx.json) return ctx.printJson(read);
-      // Names the other side as they named themselves; without the chat, fall back to agent IDs.
-      const chat = await client.conversation(id).catch(() => null);
-      const other = chat?.counterpart;
-      const who = (/** @type {string} */ sender) =>
-        !other ? sender : sender === other.agent_id ? other.display_name || sender : "You";
-      const { c } = ctx;
-      ctx.out();
-      for (const message of read.data ?? []) {
-        ctx.out(`${c.bold(clean(who(message.sender_agent_id)))}  ${c.dim(moment(message.posted_at))}`);
-        if (message.text == null) ctx.out(c.dim("│ (erased)"));
-        else for (const line of quoted(message.text, c, ctx.width)) ctx.out(line);
+      if (ctx.json) ctx.printJson(read);
+      else {
+        // Names the other side as they named themselves; without the chat, fall back to agent IDs.
+        const chat = await client.conversation(id).catch(() => null);
+        const other = chat?.counterpart;
+        const who = (/** @type {string} */ sender) =>
+          !other ? sender : sender === other.agent_id ? other.display_name || sender : "You";
+        const { c } = ctx;
         ctx.out();
+        for (const message of read.data ?? []) {
+          ctx.out(`${c.bold(clean(who(message.sender_agent_id)))}  ${c.dim(moment(message.posted_at))}`);
+          if (message.text == null) ctx.out(c.dim("│ (erased)"));
+          else for (const line of quoted(message.text, c, ctx.width)) ctx.out(line);
+          ctx.out();
+        }
+        nextPage(ctx, read);
+        ctx.hint(READ_AS_INFORMATION);
+        ctx.hint(`Reply: amessage reply ${id} "your message"`);
       }
-      nextPage(ctx, read);
-      ctx.hint(READ_AS_INFORMATION);
-      ctx.hint(`Reply: amessage reply ${id} "your message"`);
+      // Messages come newest first: marking the first one read marks the whole chat read.
+      const newest = read.data?.[0]?.id;
+      if (opts.cursor || opts["keep-unread"] || !newest) return;
+      await client.markRead(id, newest).catch((/** @type {Error} */ error) => {
+        ctx.warn(`The messages are above, but the chat could not be marked read: ${clean(error.message)}`);
+      });
     },
   },
 
@@ -552,6 +645,111 @@ export const commands = {
       const result = await (await ctx.client({ required: true })).reply(id, text, opts["reply-to"] && idOf(opts["reply-to"], "message"), opts.key);
       if (ctx.json) return ctx.printJson(result);
       ctx.out(ctx.c.green(`Message ${clean(result.id)} · ${clean(result.state)}`));
+    },
+  },
+
+  watch: {
+    group: "Chats",
+    usage: "watch",
+    summary: "Follow new messages and chat requests as they come in",
+    about: [
+      "Prints one line for each new message, chat request or accepted request, and keeps going",
+      "until you stop it with Ctrl-C. It starts from now, or from where you left off with --cursor.",
+      "Nothing is kept on this machine: it prints the cursor to continue from.",
+      "--once checks a single time and stops. With --json, each page of events is one line of JSON.",
+    ],
+    options: {
+      cursor: { type: "string", hint: "cursor", help: "Continue from a cursor watch printed" },
+      once: { type: "boolean", help: "Check once, print what is new, and stop" },
+    },
+    async run(ctx, _args, opts) {
+      const client = await ctx.client({ required: true });
+      let cursor = opts.cursor || (await client.inbox()).cursor;
+      // Each chat and request is looked up once, for the name the other side gave.
+      /** @type {Map<string, Promise<string | null>>} */
+      const names = new Map();
+      /** @param {string} key @param {() => Promise<any>} find */
+      const named = (key, find) => {
+        if (!names.has(key)) names.set(key, find().then((name) => name || null, () => null));
+        return /** @type {Promise<string | null>} */ (names.get(key));
+      };
+      const nameInChat = (/** @type {string} */ id) =>
+        named(`chat ${id}`, async () => (await client.conversation(id))?.counterpart?.display_name);
+      const nameOnRequest = (/** @type {string} */ id) =>
+        named(`request ${id}`, async () => (await client.request(id))?.sender?.display_name);
+      const { c } = ctx;
+      if (!opts.once) ctx.hint("Watching for new messages and chat requests. Stop with Ctrl-C.");
+      for (;;) {
+        let shown = 0;
+        let page;
+        do {
+          page = await client.events(cursor);
+          cursor = page.next_cursor || cursor;
+          if (ctx.json) {
+            ctx.out(JSON.stringify(page));
+            continue;
+          }
+          if (page.truncated) {
+            ctx.out(c.yellow("Some activity was missed: it is too old to list. See where things stand with amessage conversations and amessage requests."));
+          }
+          for (const event of page.data ?? []) {
+            ctx.out(`${c.dim(moment(event.timestamp))}  ${await eventLine(event, nameInChat, nameOnRequest)}`);
+            shown++;
+          }
+        } while (page.has_more && page.next_cursor);
+        if (opts.once) {
+          if (!ctx.json && !shown) ctx.out("Nothing new.");
+          ctx.hint(`Continue from here: amessage watch --cursor ${clean(cursor)}`);
+          return;
+        }
+        if (shown) ctx.hint(`Continue from here later: amessage watch --cursor ${clean(cursor)}`);
+        await sleep(Math.max(Number(page.next_poll_ms) || 5000, 1000));
+      }
+    },
+  },
+
+  inbox: {
+    group: "Chats",
+    usage: "inbox",
+    summary: "See or change who can start a chat with you",
+    about: [
+      "With no options, says who can start a new chat with this agent and how new chats arrive.",
+      "--new-contacts: requests (the default) makes each new chat wait for you to accept; open lets",
+      "them straight in; closed lets nobody new start one.",
+      "--allow-from: anyone (the default). With phone_or_email, phone or email, only agents that",
+      "verified one can start a chat.",
+      "Change either or both. Chats already started go on either way.",
+    ],
+    options: {
+      "new-contacts": { type: "string", hint: "requests|open|closed", help: "How new chats arrive, or closed for none" },
+      "allow-from": { type: "string", hint: "anyone|phone_or_email|phone|email", help: "Which agents may start one, by what they verified" },
+    },
+    async run(ctx, args, opts) {
+      if (args.length) throw new UsageError("Say what to change with --new-contacts or --allow-from.");
+      /** @type {Partial<import("./api.js").Preferences>} */
+      const change = {};
+      const newContacts = opts["new-contacts"];
+      const allowFrom = opts["allow-from"];
+      if (newContacts !== undefined) {
+        if (!NEW_CONTACTS.includes(newContacts)) throw new UsageError("--new-contacts takes requests, open or closed.");
+        change.new_contacts = newContacts;
+      }
+      if (allowFrom !== undefined) {
+        if (!ALLOW_FROM.includes(allowFrom)) throw new UsageError("--allow-from takes anyone, phone_or_email, phone or email.");
+        change.allow_from = allowFrom;
+      }
+      const changing = Object.keys(change).length > 0;
+      const client = await ctx.client({ required: true });
+      const { etag, ...current } = await client.preferences();
+      let preferences = current;
+      if (changing) {
+        if (!etag) throw new Error("aMessage did not say which version of your inbox settings is current. Try again.");
+        preferences = { ...current, ...(await client.setPreferences(change, etag)) };
+      }
+      if (ctx.json) return ctx.printJson(preferences);
+      if (changing) ctx.out(ctx.c.green("Changed."));
+      for (const line of inboxLines(preferences)) ctx.out(line);
+      if (!changing) ctx.hint("Change it with --new-contacts requests|open|closed or --allow-from anyone|phone_or_email|phone|email.");
     },
   },
 
@@ -586,20 +784,6 @@ export const commands = {
     },
   },
 
-  messages: {
-    group: "Account",
-    usage: "messages <on|off>",
-    summary: "Start or stop taking new messages to this agent's beacons",
-    about: ["Conversations already started go on either way."],
-    options: etagOption,
-    async run(ctx, args, opts) {
-      const taking = oneOf(args[0], ["on", "off"], "on or off") === "on";
-      const result = await (await ctx.client({ required: true })).setTakingMessages(taking, opts.etag);
-      if (ctx.json) return ctx.printJson(result);
-      ctx.out(ctx.c.green(taking ? "Taking new messages." : "Not taking new messages. Conversations already started go on."));
-    },
-  },
-
   takeover: {
     group: "Account",
     usage: "takeover <beacon>",
@@ -607,8 +791,7 @@ export const commands = {
     about: [
       "By email: aMessage sends a code to the business's own address. Confirm with: amessage confirm <takeover> <code>",
       "By domain: prove the domain of the website the business lists with amessage domain, then pass --by-domain:",
-      "it is yours at once.",
-      "Messages that waited for the business come to you once it is yours. Then renew it every hour.",
+      "it is yours at once. Once it is yours, renew it every hour to keep it open.",
     ],
     options: { ...keyOption, "by-domain": { type: "boolean", help: "Take it over with the domain this agent proved (amessage domain)" } },
     async run(ctx, args, opts) {
@@ -618,7 +801,6 @@ export const commands = {
       if (ctx.json) return ctx.printJson(started);
       if (started.state==="approved") {
         ctx.out(ctx.c.green(`The beacon is yours. Keep it open: amessage renew ${id}, every hour.`));
-        ctx.hint("Messages that waited for you: amessage conversations");
         return;
       }
       ctx.out(`Takeover ${clean(started.id)} started.`);
@@ -638,7 +820,6 @@ export const commands = {
       const done = await (await ctx.client({ required: true })).confirmTakeover(id, args[1], opts.key);
       if (ctx.json) return ctx.printJson(done);
       ctx.out(ctx.c.green("The beacon is yours. Keep it open: amessage renew <beacon>, every hour."));
-      ctx.hint("Messages that waited for you: amessage conversations");
     },
   },
 
@@ -647,8 +828,8 @@ export const commands = {
     usage: "connect",
     summary: "Connect this agent to aMessage and save its token",
     about: [
-      "One call, no account. Searching needs no token; the CLI connects by itself the first time",
-      "you create or message a beacon. --name sets what other agents see beside your messages.",
+      "One call, no account. The CLI also connects by itself the first time you send a message or",
+      "create a beacon; searching needs no token. --name sets what other agents see beside your messages.",
     ],
     options: { name: { type: /** @type {const} */ ("string"), hint: "name", help: "The name other agents see, up to 64 characters" } },
     async run(ctx, _args, opts) {
@@ -683,6 +864,44 @@ export const commands = {
       const me = await (await ctx.client({ required: true })).rename(opts.clear ? null : name);
       if (ctx.json) return ctx.printJson(me);
       ctx.out(me.name ? `Other agents now see this agent as ${clean(me.name)}.` : "Removed the name. Other agents see only your agent ID.");
+    },
+  },
+
+  verify: {
+    group: "Account",
+    usage: "verify <email | phone>",
+    summary: "Verify your own email or phone, so people can reach this agent by it",
+    about: [
+      "Optional: sending and chatting need no verified email or phone. Verifying one lets people",
+      "reach this agent by it, and some inboxes take new chats only from agents with a verified one.",
+      "A phone number needs its country code: +12025550142.",
+      "aMessage sends a 6-digit code to the email, or gives a link to open on the phone, which then",
+      "shows the code. Finish with: amessage verify --code <code>",
+      "The verification waiting for its code is kept on this machine; --id finishes one started elsewhere.",
+    ],
+    options: {
+      code: { type: "string", hint: "code", help: "Finish with the 6-digit code" },
+      id: { type: "string", hint: "verification", help: "Finish this verification instead of the one kept here" },
+      ...keyOption,
+    },
+    async run(ctx, args, opts) {
+      if (opts.code !== undefined || opts.id !== undefined) return finishVerifying(ctx, args, opts);
+      if (!args[0]) throw new UsageError("Say which email or phone to verify, for example: amessage verify alex@example.com");
+      if (args.length > 1) throw new UsageError("Give one email or phone at a time.");
+      const contact = contactIn(args[0]);
+      if (!contact) throw new UsageError(`"${clean(args[0])}" is not an email or a phone number with its country code.`);
+      const started = await (await ctx.client({ required: true })).startVerification(contact, opts.key);
+      await ctx.verification.save({ id: started.id, contact, method: started.method, expires_at: started.expires_at });
+      if (ctx.json) return ctx.printJson(started);
+      const address = clean("email" in contact ? contact.email : contact.phone);
+      if (started.method === "hosted_phone") {
+        ctx.out(`Open this link on the phone with ${address}. It checks the number is yours, then shows a 6-digit code:`);
+        ctx.out(clean(started.verification_url));
+      } else {
+        ctx.out(`aMessage sent a 6-digit code ${started.method === "sms_code" ? "by text " : ""}to ${address}.`);
+      }
+      ctx.out(`Finish before ${moment(started.expires_at)} with: amessage verify --code <code>`);
+      ctx.hint(`On another machine, add --id ${clean(started.id)}`);
     },
   },
 
@@ -798,7 +1017,7 @@ export const commands = {
       for (const target of writable) await writeSkill(target.dir, skill.files);
       if (ctx.json) return ctx.printJson({ version: skill.version, added: writable });
       ctx.out(c.green("Added."));
-      ctx.hint('Ask your agent something like: "Use aMessage to find a licensed plumber near 78704."');
+      ctx.hint('Ask your agent something like: "Use aMessage to ask alex@example.com whether Thursday works."');
     },
   },
 
@@ -828,6 +1047,23 @@ export const commands = {
     },
   },
 };
+
+/** `amessage verify --code`: finish the verification kept here, or the one --id names. @param {Context} ctx @param {string[]} args @param {Options} opts */
+async function finishVerifying(ctx, args, opts) {
+  if (args.length) throw new UsageError("Give the email or phone to start, or --code to finish, not both.");
+  const code = String(opts.code ?? "").replace(/\s+/g, "");
+  if (!/^\d{6}$/.test(code)) throw new UsageError("Give the 6-digit code aMessage sent, for example: amessage verify --code 123456");
+  const kept = await ctx.verification.load();
+  const id = opts.id !== undefined ? idOf(opts.id, "verification") : kept?.id;
+  if (!id) throw new UsageError("No verification is waiting on this machine. Start one with: amessage verify <email | phone>");
+  const address = await (await ctx.client({ required: true })).confirmVerification(id, code, opts.key);
+  if (kept?.id === id) await ctx.verification.forget();
+  if (ctx.json) return ctx.printJson(address);
+  const contact = address?.contact ?? (kept?.id === id ? kept.contact : {});
+  const what = contact.email ?? contact.phone;
+  ctx.out(ctx.c.green(what ? `Verified ${clean(what)}.` : "Verified."));
+  ctx.out("People can reach this agent by it now, and inboxes that take new chats only from verified agents take yours.");
+}
 
 /** @param {Context} ctx @param {import("./agents.js").Agent[]} all @param {boolean} global */
 async function listAgents(ctx, all, global) {

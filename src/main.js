@@ -7,7 +7,17 @@ import { parseArgs } from "node:util";
 import { agents, occupant, targets } from "./agents.js";
 import { ApiError, createClient, DEFAULT_API, DEFAULT_WEB, NotConnected } from "./api.js";
 import { commands, UsageError } from "./commands.js";
-import { credentialsFile, forgetCredentials, loadCredentials, saveCredentials, setting } from "./config.js";
+import {
+  credentialsFile,
+  forgetCredentials,
+  forgetVerification,
+  loadCredentials,
+  loadVerification,
+  saveCredentials,
+  saveVerification,
+  setting,
+  verificationFile,
+} from "./config.js";
 import { clean, moment, palette } from "./output.js";
 
 export const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -119,6 +129,7 @@ export async function main(argv, io = {}) {
   const home = io.home ?? homedir();
   const api = (opts.api || setting(env, "API_URL") || DEFAULT_API).replace(/\/+$/, "");
   const file = credentialsFile(env, home);
+  const pending = verificationFile(env, home);
   const send = io.fetch ?? globalThis.fetch;
   const agentName = userAgent(env);
   const interactive = !!stdin.isTTY && !!stdout.isTTY;
@@ -194,7 +205,13 @@ export async function main(argv, io = {}) {
       return result;
     },
     async forget() {
+      await forgetVerification(pending, api);
       return forgetCredentials(file, api);
+    },
+    verification: {
+      load: () => loadVerification(pending, api),
+      save: (verification) => saveVerification(pending, api, verification),
+      forget: () => forgetVerification(pending, api),
     },
     async client({ connect = false, required = false } = {}) {
       if (client) return client;
@@ -236,6 +253,11 @@ export async function main(argv, io = {}) {
  *   credentials: () => Promise<{ token: string, agent_id: string | null, source: string } | null>,
  *   connect: (options?: { primary?: boolean, name?: string }) => Promise<any>,
  *   forget: () => Promise<boolean>,
+ *   verification: {
+ *     load: () => Promise<import("./config.js").Verification | null>,
+ *     save: (verification: import("./config.js").Verification) => Promise<void>,
+ *     forget: () => Promise<boolean>,
+ *   },
  *   client: (options?: { connect?: boolean, required?: boolean }) => Promise<import("./api.js").Client>,
  * }} Context
  */
@@ -290,7 +312,7 @@ function report(ctx, stderr, error, command) {
   }
   if (error instanceof NotConnected) {
     say(c.red(error.message));
-    say("Run amessage connect, or create a beacon with amessage create, which connects on the way.");
+    say('Send a message with amessage send <agent-id | phone | email> "message", which connects on the way, or run amessage connect.');
     return 1;
   }
   if (error instanceof ApiError) {
@@ -395,8 +417,10 @@ function mainHelp(c) {
     "",
     c.bold("Examples"),
     "  amessage connect",
-    "  amessage chat",
+    '  amessage send alex@example.com "Does Thursday work?"',
+    "  amessage watch",
     "  amessage conversations",
+    "  amessage read <conversation>",
     '  amessage search "a plumber near 78704"',
     '  amessage message <beacon> "Can you come at 10?"',
     '  amessage create "Example Plumbing, Austin. Repairs, repipes and water heaters. Email quotes@example.com." --lat 30.2416 --lng -97.7695',

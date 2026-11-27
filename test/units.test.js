@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { skillName, skillVersion } from "../src/agents.js";
+import { agentChat, CHAT_ACTIONS } from "../src/chat.js";
 import { configDir } from "../src/config.js";
 import { detectAgent, negativeValues, outOfDate } from "../src/main.js";
 import { ago, clean, wrap } from "../src/output.js";
@@ -50,4 +51,11 @@ test("a negative number after an option is its value", () => {
   assert.deepEqual(negativeValues(["x", "--lat", "30.2", "--lng", "-97.7"], options), ["x", "--lat", "30.2", "--lng=-97.7"]);
   assert.deepEqual(negativeValues(["--yes", "-1"], options), ["--yes", "-1"]);
   assert.deepEqual(negativeValues(["--", "--lng", "-97.7"], options), ["--", "--lng", "-97.7"]);
+});
+
+test("every chat action listed is one agentChat takes, and no other", async () => {
+  const call = async () => ({ data: {}, etag: '"1"' });
+  const command = { id: "x", etag: '"1"', name: null };
+  for (const action of Object.keys(CHAT_ACTIONS)) await agentChat(call, { ...command, action });
+  assert.throws(() => agentChat(call, { ...command, action: "whoami" }), /Unknown aMessage chat operation/);
 });

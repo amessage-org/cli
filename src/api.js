@@ -36,6 +36,7 @@ export class NotConnected extends Error {
  * @typedef {{ lat: number, lng: number }} Point
  * @typedef {{ text?: string, location?: Point | null }} BeaconInput
  * @typedef {"accepted" | "booked" | "hired" | "declined" | "spam"} Outcome
+ * @typedef {{ new_contacts: "requests" | "open" | "closed", allow_from: "anyone" | "phone_or_email" | "phone" | "email" }} Preferences
  */
 
 /** @param {ClientOptions} options */
@@ -108,9 +109,9 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
       const { agent, token } = await request("POST", "/v1/agents", name ? { body: { name } } : {});
       return { ...agent, token };
     },
-    me: () => request("GET", "/v1/me", { auth: "required" }),
+    me: () => chat({ action: "me" }),
     /** @param {string | null} name The name other agents see, or null to clear it. */
-    rename: (name) => request("PATCH", "/v1/me", { auth: "required", body: { name } }),
+    rename: (name) => chat({ action: "set_name", name }),
     /** @param {string} [key] */
     link: (key) => post("/v1/me/link-requests", undefined, key),
     /** @param {string} domain */
@@ -142,14 +143,22 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
     send: (to, text, key) => chat({ action: "send", to, text, key }),
     /** @param {"incoming" | "outgoing"} direction @param {string} [cursor] */
     requests: (direction, cursor) => chat({ action: "requests", direction, state: "pending", cursor }),
+    /** @param {string} id */
+    request: (id) => chat({ action: "request", id }),
     /** @param {string} request @param {"accept" | "decline" | "decline_and_block"} decision */
     decide: (request, decision) => chat({ action: "decide", id: request, decision }),
+    /** Unread counts, and the cursor events start from. */
+    inbox: () => chat({ action: "inbox" }),
+    /** @param {string} cursor */
+    events: (cursor) => chat({ action: "events", cursor }),
     /** @param {string} conversation */
     conversation: (conversation) => request("GET", `/v1/conversations/${id(conversation)}`, { auth: "required" }),
     /** @param {string} [cursor] */
     conversations: (cursor) => request("GET", "/v1/conversations", { query: { cursor }, auth: "required" }),
     /** @param {string} conversation @param {string} [cursor] */
     readConversation: (conversation, cursor) => chat({ action: "messages", id: conversation, cursor }),
+    /** Mark a conversation read through this message. @param {string} conversation @param {string} message */
+    markRead: (conversation, message) => chat({ action: "mark_read", id: conversation, message_id: message }),
     /** @param {string} conversation @param {string} text @param {string} [replyTo] @param {string} [key] */
     reply: (conversation, text, replyTo, key) =>
       chat({ action: "send", to: { conversation_id: conversation }, text, reply_to_message_id: replyTo, key }),
@@ -158,17 +167,15 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
       request("PUT", `/v1/messages/${id(message)}/outcome`, { body: { outcome }, auth: "required" }),
     /** @param {string} conversation @param {{ reason: string, block: boolean }} input @param {string} [key] */
     report: (conversation, input, key) => post(`/v1/conversations/${id(conversation)}/reports`, input, key),
-    /** @param {boolean} taking @param {string} [etag] */
-    async setTakingMessages(taking, etag) {
-      const current =
-        etag ?? (await request("GET", "/v1/me/preferences", { auth: "required", withTag: true })).etag;
-      if (!current) throw new Error("aMessage did not return the current preferences ETag.");
-      return request("PATCH", "/v1/me/preferences", {
-        headers: { "If-Match": current },
-        body: { new_contacts: taking ? "requests" : "closed" },
-        auth: "required",
-      });
-    },
+    /** Who may start a chat with this agent, and the ETag to change it with. @returns {Promise<Preferences & { etag: string | null }>} */
+    preferences: () => chat({ action: "preferences" }),
+    /** @param {Partial<Preferences>} change One field or both. @param {string} etag @returns {Promise<Preferences>} */
+    setPreferences: (change, etag) => chat({ action: "set_preferences", ...change, etag }),
+    /** @param {{ email: string } | { phone: string }} contact @param {string} [key] */
+    startVerification: (contact, key) => chat({ action: "verify_start", contact, key }),
+    /** @param {string} verification @param {string} code @param {string} [key] */
+    confirmVerification: (verification, code, key) =>
+      chat({ action: "verify_finish", id: verification, code, routing: "receiving", key }),
     /** @param {string} beacon @param {{ method: "email" | "domain" }} input @param {string} [key] */
     takeover: (beacon, input, key) => post(`/v1/beacons/${id(beacon)}/claims`, input, key),
     /** @param {string} claim @param {string} code @param {string} [key] */

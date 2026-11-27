@@ -196,10 +196,10 @@ test("a sender can retry a private phone draft by its original message id", asyn
   assert.equal(api.requests.length, 4);
 });
 
-test("account preferences use current ETag, domain and email claims use resource ids", async () => {
+test("inbox settings use the current ETag, domain and email claims use resource ids", async () => {
   const api = fakeApi({
-    "GET /v1/me/preferences": () => [200, { new_contacts: "requests" }, { etag: '"prefs"' }],
-    "PATCH /v1/me/preferences": () => [200, { new_contacts: "closed" }],
+    "GET /v1/me/preferences": () => [200, { new_contacts: "requests", allow_from: "anyone" }, { etag: '"prefs"' }],
+    "PATCH /v1/me/preferences": () => [200, { new_contacts: "closed", allow_from: "anyone" }],
     [`POST /v1/beacons/${BEACON_ID}/claims`]: ({ body }) => [
       201,
       { id: CONVERSATION_ID, state: body.method === "domain" ? "approved" : "pending" },
@@ -207,13 +207,17 @@ test("account preferences use current ETag, domain and email claims use resource
     [`POST /v1/claims/${CONVERSATION_ID}/confirm`]: () => [200, { state: "approved" }],
   });
   const runAs = (args) => run(args, { fetch: api.fetch, env });
-  assert.equal((await runAs(["messages", "off"])).code, 0);
+  assert.equal((await runAs(["inbox", "--new-contacts", "closed"])).code, 0);
   assert.deepEqual(api.requests[1].body, { new_contacts: "closed" });
   assert.equal(api.requests[1].headers["if-match"], '"prefs"');
   assert.match((await runAs(["takeover", BEACON_ID])).out, new RegExp(CONVERSATION_ID));
-  assert.match((await runAs(["takeover", BEACON_ID, "--by-domain"])).out, /The beacon is yours/);
-  assert.equal((await runAs(["confirm", CONVERSATION_ID, "123456", "--key", key])).code, 0);
+  const approved = await runAs(["takeover", BEACON_ID, "--by-domain"]);
+  assert.match(approved.out, /The beacon is yours/);
+  const confirmed = await runAs(["confirm", CONVERSATION_ID, "123456", "--key", key]);
+  assert.equal(confirmed.code, 0);
   assert.equal(api.requests.at(-1).headers["idempotency-key"], key);
+  // Seeded beacons take no messages, so none waited for the business.
+  for (const result of [approved, confirmed, await runAs(["takeover", "--help"])]) assert.doesNotMatch(result.out, /waited/);
 });
 
 test("create refuses an empty or too-long beacon, half a point, and the old --until, before anything is sent", async () => {
@@ -506,7 +510,7 @@ test("the old commands are gone, and usage mistakes exit with 2 and point at hel
     "find",
     "post",
     "listings",
-    "inbox",
+    "messages",
     "end",
     "on",
     "off",
@@ -523,4 +527,264 @@ test("the old commands are gone, and usage mistakes exit with 2 and point at hel
   const badFlag = await run(["search", "--category", "jobs", "x"]);
   assert.equal(badFlag.code, 2);
   assert.match(badFlag.err, /\bamessage search --help/);
+});
+
+test("inbox says who can start a chat, and changes either setting with the current ETag", async () => {
+  let current = { new_contacts: "requests", allow_from: "anyone" };
+  const api = fakeApi({
+    "GET /v1/me/preferences": () => [200, current, { etag: '"7"' }],
+    "PATCH /v1/me/preferences": ({ body }) => {
+      current = { ...current, ...body };
+      return [200, current, { etag: '"8"' }];
+    },
+  });
+  const cli = (/** @type {string[]} */ argv) => run(["inbox", ...argv], { fetch: api.fetch, env });
+  const shown = await cli([]);
+  assert.equal(shown.code, 0, shown.err);
+  assert.match(shown.out, /Any agent can start a chat with you\./);
+  assert.match(shown.out, /New chats arrive as requests: their message stays hidden until you accept\./);
+  assert.match(shown.out, /--new-contacts requests\|open\|closed/);
+  assert.equal(api.requests.length, 1);
+
+  const both = await cli(["--new-contacts", "open", "--allow-from", "phone"]);
+  assert.equal(both.code, 0, both.err);
+  assert.equal(api.requests.at(-1).method, "PATCH");
+  assert.equal(api.requests.at(-1).headers["if-match"], '"7"');
+  assert.deepEqual(api.requests.at(-1).body, { new_contacts: "open", allow_from: "phone" });
+  assert.match(both.out, /Changed\.\nOnly agents with a verified phone can start a chat with you\.\nNew chats come straight in\./);
+
+  const one = await cli(["--allow-from", "phone_or_email"]);
+  assert.deepEqual(api.requests.at(-1).body, { allow_from: "phone_or_email" });
+  assert.match(one.out, /Only agents with a verified phone or email/);
+
+  const closed = await cli(["--new-contacts", "closed"]);
+  assert.match(closed.out, /Nobody new can start a chat with you\. Chats already started go on\./);
+  assert.match(closed.out, /When you open it again, only agents with a verified phone or email can start one\./);
+  assert.deepEqual(JSON.parse((await cli(["--json"])).out), { new_contacts: "closed", allow_from: "phone_or_email" });
+
+  const sent = api.requests.length;
+  for (const argv of [["off"], ["--new-contacts", "on"], ["--allow-from", "verified"], ["--etag", '"7"']]) {
+    assert.equal((await cli(argv)).code, 2, argv.join(" "));
+  }
+  assert.equal(api.requests.length, sent);
+});
+
+test("read marks the chat read through its newest message, unless --keep-unread or --cursor", async () => {
+  const NEWEST = "5d79f608-6601-4ef5-aa6c-c50d85c895ea";
+  const api = fakeApi({
+    [`GET /v1/conversations/${CONVERSATION_ID}/messages`]: () => [
+      200,
+      {
+        data: [
+          { id: NEWEST, sender_agent_id: "them", text: "Done.", posted_at: "2026-11-27T09:01:00Z" },
+          { id: BEACON_ID, sender_agent_id: "me", text: "Check the build?", posted_at: "2026-11-27T09:00:00Z" },
+        ],
+        next_cursor: "older",
+      },
+    ],
+    [`PUT /v1/conversations/${CONVERSATION_ID}/read-position`]: ({ body }) => [200, body],
+  });
+  const cli = (/** @type {string[]} */ argv) => run(["read", CONVERSATION_ID, ...argv], { fetch: api.fetch, env });
+  const marks = () => api.requests.filter((r) => r.method === "PUT");
+
+  const read = await cli([]);
+  assert.equal(read.code, 0, read.err);
+  assert.match(read.out, /Done\./);
+  assert.equal(marks().length, 1);
+  assert.deepEqual(marks()[0].body, { message_id: NEWEST });
+  assert.equal(marks()[0].url.pathname, `/v1/conversations/${CONVERSATION_ID}/read-position`);
+
+  assert.equal((await cli(["--json"])).code, 0);
+  assert.equal(marks().length, 2);
+  await cli(["--keep-unread"]);
+  await cli(["--cursor", "older"]);
+  assert.equal(marks().length, 2);
+
+  // The messages were read even if marking them read fails, so it only warns.
+  const failing = fakeApi({ [`GET /v1/conversations/${CONVERSATION_ID}/messages`]: () => [200, { data: [{ id: NEWEST, text: "Hi" }], next_cursor: null }] });
+  const warned = await run(["read", CONVERSATION_ID], { fetch: failing.fetch, env });
+  assert.equal(warned.code, 0);
+  assert.match(warned.out, /Hi/);
+  assert.match(warned.err, /could not be marked read/);
+});
+
+test("verify starts with an email or phone, keeps the waiting verification, and finishes with --code", async () => {
+  const VERIFICATION = "9f0c7f43-2d1b-4c55-8a3e-0d6f5b9a1c2e";
+  const HOSTED = "1e2d3c4b-5a69-4788-9a0b-c1d2e3f4a5b6";
+  const api = fakeApi({
+    "POST /v1/address-verifications": ({ body }) =>
+      body.contact.email
+        ? [201, { id: VERIFICATION, method: "email_code", expires_at: "2026-11-27T10:00:00Z" }]
+        : [201, { id: HOSTED, method: "hosted_phone", verification_url: "https://amessage.sh/verify/abc", expires_at: "2026-11-27T10:00:00Z" }],
+    [`POST /v1/address-verifications/${VERIFICATION}/confirm`]: () => [
+      200,
+      { id: "a0", contact: { email: "alex@example.com" }, routing: "receiving", receiving_agent_id: "a1", etag: '"1"' },
+    ],
+    [`POST /v1/address-verifications/${HOSTED}/confirm`]: () => [
+      200,
+      { id: "a1", contact: { phone: "+12025550142" }, routing: "receiving", receiving_agent_id: "a1", etag: '"1"' },
+    ],
+  });
+  const { home } = await run(["--version"]);
+  const cli = (/** @type {string[]} */ argv) => run(["verify", ...argv], { fetch: api.fetch, env, home });
+  const kept = join(home, ".config/amessage/verification.json");
+
+  const help = await cli(["--help"]);
+  assert.match(help.out, /Optional/);
+  assert.match(help.out, /reach this agent by it/);
+  assert.match(help.out, /only from agents with a verified one/);
+
+  const started = await cli(["alex@example.com", "--key", key]);
+  assert.equal(started.code, 0, started.err);
+  assert.deepEqual(api.requests.at(-1).body, { contact: { email: "alex@example.com" } });
+  assert.equal(api.requests.at(-1).headers["idempotency-key"], key);
+  assert.match(started.out, /sent a 6-digit code to alex@example\.com/);
+  assert.match(started.out, /amessage verify --code <code>/);
+  assert.match(started.out, new RegExp(`--id ${VERIFICATION}`));
+  assert.equal((await stat(kept)).mode & 0o777, 0o600);
+
+  const finished = await cli(["--code", "123 456"]);
+  assert.equal(finished.code, 0, finished.err);
+  assert.equal(api.requests.at(-1).url.pathname, `/v1/address-verifications/${VERIFICATION}/confirm`);
+  assert.deepEqual(api.requests.at(-1).body, { code: "123456", routing: "receiving" });
+  assert.match(api.requests.at(-1).headers["idempotency-key"], /^[a-f\d-]{36}$/);
+  assert.match(finished.out, /Verified alex@example\.com\./);
+  assert.match(finished.out, /People can reach this agent by it now/);
+  await assert.rejects(stat(kept));
+
+  const phone = await cli(["+1 202 555 0142"]);
+  assert.deepEqual(api.requests.at(-1).body, { contact: { phone: "+12025550142" } });
+  assert.match(phone.out, /Open this link on the phone with \+12025550142/);
+  assert.match(phone.out, /https:\/\/amessage\.sh\/verify\/abc/);
+  // --id finishes a verification started elsewhere, and leaves the one kept here alone.
+  const elsewhere = await cli(["--code", "654321", "--id", VERIFICATION]);
+  assert.equal(elsewhere.code, 0, elsewhere.err);
+  assert.equal(api.requests.at(-1).url.pathname, `/v1/address-verifications/${VERIFICATION}/confirm`);
+  assert.equal(JSON.parse(await readFile(kept, "utf8"))["https://api.amessage.sh"].id, HOSTED);
+  assert.match((await cli(["--code", "654321"])).out, /Verified \+12025550142\./);
+
+  const sent = api.requests.length;
+  const none = await cli(["--code", "123456"]);
+  assert.equal(none.code, 2);
+  assert.match(none.err, /No verification is waiting/);
+  for (const argv of [[], ["alex"], ["2025550142"], ["alex@example.com", "--code", "123456"], ["--code", "12345"], ["--id", "nope", "--code", "123456"]]) {
+    assert.equal((await cli(argv)).code, 2, argv.join(" "));
+  }
+  assert.equal(api.requests.length, sent);
+});
+
+test("watch --once prints each new thing as a plain line, drains every page, and prints the cursor", async () => {
+  const REQUEST = "3c2b1a09-8f7e-4d6c-9b5a-4e3d2c1b0a99";
+  const OTHER = "6a5b4c3d-2e1f-4a0b-9c8d-7e6f5a4b3c2d";
+  const at = "2026-11-27T09:00:00Z";
+  const pages = {
+    snapshot: {
+      data: [
+        { eventId: "1", name: "chat.message.received", timestamp: at, data: { conversation_id: CONVERSATION_ID, message_id: BEACON_ID }, cursor: "a" },
+        { eventId: "2", name: "chat.request.received", timestamp: at, data: { request_id: REQUEST }, cursor: "b" },
+      ],
+      next_cursor: "page2",
+      has_more: true,
+      truncated: true,
+      next_poll_ms: 5000,
+    },
+    page2: {
+      data: [
+        { eventId: "3", name: "chat.request.accepted", timestamp: at, data: { request_id: REQUEST, conversation_id: OTHER }, cursor: "c" },
+        { eventId: "4", name: "chat.message.received", timestamp: at, data: { conversation_id: CONVERSATION_ID, message_id: REQUEST }, cursor: "d" },
+      ],
+      next_cursor: "after",
+      has_more: false,
+      truncated: false,
+      next_poll_ms: 5000,
+    },
+    after: { data: [], next_cursor: "after", has_more: false, truncated: false, next_poll_ms: 5000 },
+  };
+  const api = fakeApi({
+    "GET /v1/inbox": () => [200, { inbox_id: "i", unread_conversations: 1, incoming_requests: 1, outgoing_requests: 0, cursor: "snapshot" }],
+    "GET /v1/events": ({ url }) => [200, pages[/** @type {keyof typeof pages} */ (url.searchParams.get("cursor"))]],
+    [`GET /v1/conversations/${CONVERSATION_ID}`]: () => [200, { id: CONVERSATION_ID, counterpart: { agent_id: "them", display_name: "Build bot", verified: [] } }],
+    [`GET /v1/requests/${REQUEST}`]: () => [200, { id: REQUEST, state: "pending", direction: "incoming", sender: { agent_id: "s", display_name: "Alex's agent", verified: [] } }],
+  });
+  const cli = (/** @type {string[]} */ argv) => run(["watch", "--once", ...argv], { fetch: api.fetch, env });
+
+  const watched = await cli([]);
+  assert.equal(watched.code, 0, watched.err);
+  assert.deepEqual(
+    api.requests.filter((r) => r.url.pathname === "/v1/events").map((r) => r.url.searchParams.get("cursor")),
+    ["snapshot", "page2"],
+  );
+  const lines = watched.out.trim().split("\n");
+  assert.match(lines[0], /Some activity was missed/);
+  assert.match(lines[1], new RegExp(`^\\d{1,2} Nov \\d\\d:\\d\\d  New message in chat ${CONVERSATION_ID} from Build bot\\.$`));
+  assert.match(lines[2], new RegExp(`New chat request ${REQUEST} from Alex's agent\\.$`));
+  // The other chat has no name to give (the fake API has no such chat), so the line leaves it out.
+  assert.match(lines[3], new RegExp(`Chat request accepted: chat ${OTHER} is open\\.$`));
+  assert.match(lines[4], /New message in chat .* from Build bot\./);
+  assert.match(lines[5], /amessage watch --cursor after/);
+  // Each chat is looked up once for its name.
+  assert.equal(api.requests.filter((r) => r.url.pathname === `/v1/conversations/${CONVERSATION_ID}`).length, 1);
+
+  const later = await cli(["--cursor", "after"]);
+  assert.equal(api.requests.at(-1).url.searchParams.get("cursor"), "after");
+  assert.equal(api.requests.filter((r) => r.url.pathname === "/v1/inbox").length, 1);
+  assert.match(later.out, /Nothing new\./);
+
+  const json = await cli(["--cursor", "page2", "--json"]);
+  assert.deepEqual(json.out.trim().split("\n").map((line) => JSON.parse(line)), [pages.page2]);
+});
+
+test("chat lists its actions in help and when an action is unknown, and reads and sets the name", async () => {
+  const api = fakeApi({
+    "GET /v1/me": () => [200, { agent_id: "a1", inbox_id: "i1", name: null, linked_to_account: false }],
+    "PATCH /v1/me": ({ body }) => [200, { agent_id: "a1", inbox_id: "i1", name: body.name, linked_to_account: false }],
+  });
+  const chat = (/** @type {unknown} */ command) => run(["chat", "-"], { fetch: api.fetch, env, stdin: JSON.stringify(command) });
+  const help = await run(["chat", "--help"]);
+  for (const action of ["inbox", "events", "send", "send_draft", "decide", "mark_read", "set_preferences", "verify_start", "verify_finish", "me", "set_name"]) {
+    assert.match(help.out, new RegExp(`^  ${action} +\\S`, "m"), action);
+  }
+  const unknown = await chat({ action: "whoami" });
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.err, /Unknown aMessage chat operation\. Use one of: inbox, events, send, .*set_name\./);
+  assert.equal(api.requests.length, 0);
+
+  assert.deepEqual(JSON.parse((await chat({ action: "me" })).out).agent_id, "a1");
+  assert.equal(api.requests.at(-1).method, "GET");
+  assert.equal(JSON.parse((await chat({ action: "set_name", name: "Build bot" })).out).name, "Build bot");
+  assert.deepEqual(api.requests.at(-1).body, { name: "Build bot" });
+  await chat({ action: "set_name", name: null });
+  assert.deepEqual(api.requests.at(-1).body, { name: null });
+  const nameless = await chat({ action: "set_name" });
+  assert.equal(nameless.code, 1);
+  assert.match(nameless.err, /set_name requires name/);
+  assert.equal(api.requests.length, 3);
+});
+
+test("hints point at chatting first: not connected, after add, and after messaging a beacon", async () => {
+  const notConnected = await run(["requests"]);
+  assert.equal(notConnected.code, 1);
+  assert.match(notConnected.err, /amessage send .* or run amessage connect/);
+  assert.doesNotMatch(notConnected.err, /beacon|amessage create/);
+
+  const skill = '---\nname: amessage\nmetadata:\n  version: "1.19.0"\n---\n# aMessage\n';
+  const site = fakeApi({ "GET /skill.md": () => [200, skill], "GET /heartbeat.md": () => [200, "# Heartbeat\n"] });
+  const added = await run(["add", "-a", "claude-code"], { fetch: site.fetch });
+  assert.equal(added.code, 0, added.err);
+  assert.match(added.out, /Use aMessage to ask alex@example\.com/);
+  assert.doesNotMatch(added.out, /plumber/);
+
+  const api = fakeApi({
+    "POST /v1/messages": ({ body }) =>
+      body.text === "Now?"
+        ? [201, { id: BEACON_ID, state: "posted", conversation_id: CONVERSATION_ID }]
+        : [201, { id: BEACON_ID, state: "pending", request_id: CONVERSATION_ID, conversation_id: null }],
+  });
+  const pending = await run(["message", BEACON_ID, "Free Friday?"], { fetch: api.fetch, env });
+  assert.match(pending.out, /Sent as a chat request\. It reaches them when they accept\./);
+  assert.match(pending.out, /amessage requests --outgoing/);
+  const posted = await run(["message", BEACON_ID, "Now?"], { fetch: api.fetch, env });
+  assert.match(posted.out, /^Sent\.$/m);
+  assert.match(posted.out, new RegExp(`amessage read ${CONVERSATION_ID}`));
+  for (const result of [pending, posted]) assert.doesNotMatch(result.out, /Introduction requested|Message stored/);
 });

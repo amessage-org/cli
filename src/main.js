@@ -178,8 +178,8 @@ export async function main(argv, io = {}) {
       if (!yes) throw new Cancelled("Nothing changed.");
     },
     credentials,
-    async connect({ primary = false } = {}) {
-      const result = await createClient({ base: api, userAgent: agentName, fetch: send }).connect();
+    async connect({ primary = false, name = undefined } = {}) {
+      const result = await createClient({ base: api, userAgent: agentName, fetch: send }).connect(name);
       await saveCredentials(file, api, {
         agent_id: result.agent_id,
         token: result.token,
@@ -189,7 +189,7 @@ export async function main(argv, io = {}) {
       tokenSource = tilde(file);
       client = null;
       const say = primary && !ctx.json ? ctx.out : (/** @type {string} */ line) => write(stderr, line);
-      say(c.green(`Connected this agent to aMessage. Agent ${clean(result.agent_id)}.`));
+      say(c.green(`Connected this agent to aMessage${result.name ? ` as ${clean(result.name)}` : ""}. Agent ${clean(result.agent_id)}.`));
       say(c.dim(`The token is saved in ${tilde(file)}, readable only by you.`));
       return result;
     },
@@ -234,7 +234,7 @@ export async function main(argv, io = {}) {
  *   printJson: (value: unknown) => void, readStdin: () => Promise<string>,
  *   confirm: (question: string, preferYes: boolean) => Promise<void>,
  *   credentials: () => Promise<{ token: string, agent_id: string | null, source: string } | null>,
- *   connect: (options?: { primary?: boolean }) => Promise<any>,
+ *   connect: (options?: { primary?: boolean, name?: string }) => Promise<any>,
  *   forget: () => Promise<boolean>,
  *   client: (options?: { connect?: boolean, required?: boolean }) => Promise<import("./api.js").Client>,
  * }} Context

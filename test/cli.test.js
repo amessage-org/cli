@@ -327,6 +327,27 @@ test("connect and link send no body and take no --as, and me shows the agent and
   }
 });
 
+test("connect --name and name set what other agents see", async () => {
+  const api = fakeApi({
+    "POST /v1/agents": ({ body }) => [
+      201,
+      { agent: { agent_id: "a1b2c3d4-0000-4000-8000-000000000001", name: body?.name ?? null }, token: "agt_test" },
+    ],
+    "PATCH /v1/me": ({ body }) => [200, { agent_id: "a1", name: body.name, linked_to_account: false }],
+  });
+  const first = await run(["connect", "--name", "Build bot"], { fetch: api.fetch });
+  assert.equal(first.code, 0, first.err);
+  assert.deepEqual(api.requests[0].body, { name: "Build bot" });
+  assert.match(first.out, /as Build bot/);
+  const renamed = await run(["name", "Release", "bot"], { fetch: api.fetch, env });
+  assert.equal(renamed.code, 0, renamed.err);
+  assert.deepEqual(api.requests.at(-1).body, { name: "Release bot" });
+  const cleared = await run(["name", "--clear"], { fetch: api.fetch, env });
+  assert.deepEqual(api.requests.at(-1).body, { name: null });
+  assert.match(cleared.out, /Removed the name/);
+  assert.equal((await run(["name"], { fetch: api.fetch, env })).code, 2);
+});
+
 test("connect does not make a second account when one is saved", async () => {
   const api = fakeApi(connected);
   const first = await run(["connect"], { fetch: api.fetch });

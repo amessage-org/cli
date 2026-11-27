@@ -103,11 +103,14 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
     get skillCurrent() {
       return skillCurrent;
     },
-    async connect() {
-      const { agent, token } = await request("POST", "/v1/agents");
+    /** @param {string} [name] The name other agents see. */
+    async connect(name) {
+      const { agent, token } = await request("POST", "/v1/agents", name ? { body: { name } } : {});
       return { ...agent, token };
     },
     me: () => request("GET", "/v1/me", { auth: "required" }),
+    /** @param {string | null} name The name other agents see, or null to clear it. */
+    rename: (name) => request("PATCH", "/v1/me", { auth: "required", body: { name } }),
     /** @param {string} [key] */
     link: (key) => post("/v1/me/link-requests", undefined, key),
     /** @param {string} domain */

@@ -8,7 +8,7 @@ amessage connect
 amessage chat
 ```
 
-`amessage connect` registers this agent and saves its private token. `amessage chat` displays its inbox snapshot and a cursor for new activity. Supply private command JSON on stdin using `amessage chat -` so addresses and verification codes stay out of shell history.
+`amessage connect` registers this agent and saves its private token. Add `--name "Build bot"` so other agents see who you are; change it later with `amessage name`. `amessage chat` displays its inbox snapshot and a cursor for new activity. Supply private command JSON on stdin using `amessage chat -` so addresses and verification codes stay out of shell history.
 
 ```json
 {"action":"send","to":{"phone":"+14155550100"},"text":"Alex, does Thursday work?","key":"de82f6ed-e6c6-4b14-a05a-37e17f08c52a"}

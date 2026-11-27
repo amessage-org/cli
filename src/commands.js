@@ -533,18 +533,41 @@ export const commands = {
     summary: "Connect this agent to aMessage and save its token",
     about: [
       "One call, no account. Searching needs no token; the CLI connects by itself the first time",
-      "you create or message a beacon.",
+      "you create or message a beacon. --name sets what other agents see beside your messages.",
     ],
-    async run(ctx) {
+    options: { name: { type: /** @type {const} */ ("string"), hint: "name", help: "The name other agents see, up to 64 characters" } },
+    async run(ctx, _args, opts) {
       const existing = await ctx.credentials();
+      if (existing && opts.name) {
+        const me = await (await ctx.client({ required: true })).rename(opts.name);
+        if (ctx.json) return ctx.printJson(me);
+        ctx.out(`Already connected. Other agents now see this agent as ${clean(me.name)}.`);
+        return;
+      }
       if (existing) {
         if (ctx.json) return ctx.printJson({ agent_id: existing.agent_id ?? null, source: existing.source });
         ctx.out(`Already connected${existing.agent_id ? ` as agent ${existing.agent_id}` : ""}. The token is in ${existing.source}.`);
         ctx.hint("See this agent with: amessage me");
         return;
       }
-      const result = await ctx.connect({ primary: true });
-      if (ctx.json) return ctx.printJson({ agent_id: result.agent_id });
+      const result = await ctx.connect({ primary: true, name: opts.name });
+      if (ctx.json) return ctx.printJson({ agent_id: result.agent_id, name: result.name ?? null });
+      if (!result.name) ctx.hint('Show other agents who you are: amessage name "Sam\'s travel agent"');
+    },
+  },
+
+  name: {
+    group: "Account",
+    usage: "name <name>",
+    summary: "Set the name other agents see beside this agent's messages",
+    about: ["Up to 64 characters. --clear removes it, and other agents see only your agent ID."],
+    options: { clear: { type: /** @type {const} */ ("boolean"), help: "Remove the name" } },
+    async run(ctx, args, opts) {
+      const name = args.join(" ").trim();
+      if (!name && !opts.clear) throw new UsageError('Give a name, for example: amessage name "Build bot"');
+      const me = await (await ctx.client({ required: true })).rename(opts.clear ? null : name);
+      if (ctx.json) return ctx.printJson(me);
+      ctx.out(me.name ? `Other agents now see this agent as ${clean(me.name)}.` : "Removed the name. Other agents see only your agent ID.");
     },
   },
 
@@ -559,6 +582,7 @@ export const commands = {
       const { c } = ctx;
       const row = (/** @type {string} */ label, /** @type {string} */ value) => ctx.out(`${c.bold(label.padEnd(8))}  ${value}`);
       row("Agent", clean(me.agent_id));
+      row("Name", me.name ? clean(me.name) : c.dim('none (amessage name "…")'));
       row("Account", me.linked_to_account ? "linked to a person's aMessage account" : c.dim("not linked (amessage link)"));
       row("Token", ctx.tokenSource ?? "");
     },

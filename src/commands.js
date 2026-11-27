@@ -1352,7 +1352,8 @@ const KEY_ACTIONS = {
   async ""(ctx, args) {
     if (args.length) throw new UsageError(`"${clean(args[0])}" is not a keys command. Use create, rotate, show, trust, export or import.`);
     const client = await ctx.client({ required: true });
-    const own = await keyringOf(ctx, client).mine();
+    const ring = keyringOf(ctx, client);
+    const own = await ring.mine();
     const { c } = ctx;
     if (!own) {
       if (ctx.json) return ctx.printJson({ has_keys: false });
@@ -1362,9 +1363,9 @@ const KEY_ACTIONS = {
     }
     const fp = fingerprint(unb64(own.entry.identity.public));
     const key = currentKey(own.entry);
-    const published = await client.myKeys().catch(() => undefined);
+    const published = await ring.published().catch(() => undefined);
     const same = published?.fingerprint === fp;
-    const current = same && !!key && published.message_key?.key_id === key.key_id;
+    const current = same && !!key && published?.keys?.message_key?.key_id === key.key_id;
     const pinned = Object.keys(own.entry.pins ?? {}).length;
     if (ctx.json) {
       return ctx.printJson({
@@ -1381,8 +1382,8 @@ const KEY_ACTIONS = {
     row("Message key", key ? `${clean(key.key_id)} · until ${moment(key.expires_at)}` : c.yellow("none (amessage keys rotate)"));
     if (published === undefined) row("On aMessage", c.dim("couldn't check"));
     else if (current) row("On aMessage", "published");
-    else if (same) row("On aMessage", c.yellow("an older message key (publish the current one: amessage keys create)"));
-    else if (published) row("On aMessage", c.yellow(`other keys, ${spaced(published.fingerprint).slice(0, 19)}… (amessage keys create)`));
+    else if (same) row("On aMessage", c.yellow("not the current message key (publish it: amessage keys create)"));
+    else if (published.fingerprint) row("On aMessage", c.yellow(`other keys, ${spaced(published.fingerprint).slice(0, 19)}… (amessage keys create)`));
     else row("On aMessage", c.yellow("not published (amessage keys create)"));
     row("Pinned", `${pinned} chat partner${pinned === 1 ? "" : "s"}`);
     ctx.hint("Compare fingerprints with your chat partners to be sure of each other: amessage keys show <agent-id>");
@@ -1522,8 +1523,8 @@ const KEY_ACTIONS = {
       ctx.warn("The imported identity takes their place. Every message key is kept, so older messages still open.");
       await ctx.confirm("Import them?", false);
     }
-    const published = await client.myKeys();
-    if (published?.fingerprint && published.fingerprint !== fp) {
+    const published = await ring.published();
+    if (published.fingerprint && published.fingerprint !== fp) {
       ctx.warn(`aMessage has other keys for this agent: fingerprint ${spaced(published.fingerprint)}.`);
       ctx.warn("Publishing the imported keys replaces them, and new messages are sealed only to these.");
       await ctx.confirm("Import and publish them in their place?", false);

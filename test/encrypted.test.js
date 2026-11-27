@@ -33,8 +33,8 @@ async function privateKeys(home) {
 test("keys create makes the keys, publishes the public half and keeps the private half owner-only", async () => {
   const { state, api, home, made, cli } = await withKeys();
   // It connected on the way, looked for published keys, then published.
-  assert.deepEqual(api.requests.map((r) => `${r.method} ${r.url.pathname}`), ["POST /v1/agents", "GET /v1/me/keys", "PUT /v1/me/keys"]);
-  const put = api.requests[2].body;
+  assert.deepEqual(api.requests.map((r) => `${r.method} ${r.url.pathname}`), ["POST /v1/agents", "GET /v1/me", "GET /v1/me/keys", "PUT /v1/me/keys"]);
+  const put = api.requests[3].body;
   assert.deepEqual(Object.keys(put), ["identity_key", "message_key"]);
   assert.deepEqual(Object.keys(put.message_key), ["key_id", "public_key", "expires_at", "signature"]);
   assert.equal(keysProblem({ ...put, fingerprint: state.alice.fingerprint }), null);
@@ -75,6 +75,35 @@ test("keys create makes the keys, publishes the public half and keeps the privat
   const none = await run(["keys"], { fetch: api.fetch, env: { AMESSAGE_TOKEN: "agt_other" } });
   assert.match(none.out, /no keys for encrypted chats yet/);
   assert.equal((await cli(["keys", "nonsense"])).code, 2);
+});
+
+test("an identity made on another machine counts even when its message key lapsed and /v1/me/keys says 404", async () => {
+  const world = await twoAgents();
+  world.state.elsewhere = "ab12".repeat(16);
+  const api = fakeApi(world.routes);
+  const puts = () => api.requests.filter((r) => r.method === "PUT").length;
+  const refused = await run(["keys", "create"], { fetch: api.fetch });
+  assert.equal(refused.code, 2);
+  assert.ok(refused.err.includes(`aMessage has other keys for this agent: fingerprint ${spaced(world.state.elsewhere)}, made on another machine.`));
+  assert.match(refused.err, /amessage keys import <file>/);
+  assert.match(refused.err, /Add --yes/);
+  assert.equal(api.requests.find((r) => r.url.pathname === "/v1/me/keys")?.method, "GET");
+  assert.equal(puts(), 0);
+  await assert.rejects(stat(join(refused.home, ".config/amessage/keys.json")));
+
+  // Accepted, these keys are made and take the other machine's place.
+  const made = await run(["keys", "create", "--yes"], { fetch: api.fetch, home: refused.home });
+  assert.equal(made.code, 0, made.err);
+  assert.equal(puts(), 1);
+  // While aMessage still names the other identity, keys says so.
+  const status = await run(["keys"], { fetch: api.fetch, home: refused.home });
+  assert.match(status.out, /On aMessage\s+other keys, ab12 ab12 ab12 ab12…/);
+  assert.equal(JSON.parse((await run(["keys", "--json"], { fetch: api.fetch, home: refused.home })).out).published, false);
+  // Once it names hers, she is published, and a second create does nothing.
+  world.state.elsewhere = null;
+  assert.match((await run(["keys"], { fetch: api.fetch, home: refused.home })).out, /On aMessage\s+published/);
+  assert.match((await run(["keys", "create"], { fetch: api.fetch, home: refused.home })).out, /already has keys/);
+  assert.equal(puts(), 1);
 });
 
 test("send seals to an agent with keys, pins them, keeps a copy, and only Bob can read it", async () => {

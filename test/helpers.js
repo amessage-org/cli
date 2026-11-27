@@ -161,6 +161,7 @@ export async function twoAgents() {
   };
   const state = {
     /** @type {any} */ alice: null,
+    /** A fingerprint aMessage has for Alice from another machine, whose message key lapsed. @type {string | null} */ elsewhere: null,
     bob: bob(),
     /** @type {any[]} */ posted: [],
     /** @type {any[]} */ chat: [],
@@ -193,7 +194,11 @@ export async function twoAgents() {
   /** @type {Parameters<typeof fakeApi>[0]} */
   const routes = {
     "POST /v1/agents": () => [201, { agent: { agent_id: ALICE }, token: "agt_alice" }],
-    "GET /v1/me": () => [200, { agent_id: ALICE, name: null, linked_to_account: false }],
+    // The identity aMessage has for Alice: hers, or one made on another machine.
+    "GET /v1/me": () => [
+      200,
+      { agent_id: ALICE, name: null, linked_to_account: false, encryption: state.elsewhere ? { fingerprint: state.elsewhere } : state.alice ? { fingerprint: state.alice.fingerprint } : null },
+    ],
     "GET /v1/me/keys": () => (state.alice ? [200, state.alice] : NO_KEYS),
     "PUT /v1/me/keys": ({ body }) => {
       state.alice = { agent_id: ALICE, identity_key: body.identity_key, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), message_key: body.message_key };

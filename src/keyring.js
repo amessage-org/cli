@@ -410,19 +410,32 @@ function keyring(ctx, client) {
   }
 
   /**
+   * What aMessage has for this agent: its identity's fingerprint, from GET /v1/me, which gives it
+   * even after the weekly message key lapsed (when GET /v1/me/keys says 404), and its current
+   * keys when it has them.
+   * @returns {Promise<{ fingerprint: string | null, keys: AgentKeys | null }>}
+   */
+  async function published() {
+    const [me, keys] = await Promise.all([client.me(), client.myKeys()]);
+    // A server without `encryption` on /v1/me: its keys are the only answer.
+    const fp = me?.encryption === undefined ? (keys?.fingerprint ?? null) : (me.encryption?.fingerprint ?? null);
+    return { fingerprint: fp, keys: fp && keys?.fingerprint === fp ? keys : null };
+  }
+
+  /**
    * Make this agent's keys and publish them, or publish the ones kept here when aMessage doesn't
    * have them. `replacing` is asked first when aMessage has other keys for this agent.
    * @param {(published: string) => Promise<void>} replacing
    */
   async function create(replacing) {
     const own = await mine();
-    const published = await client.myKeys();
+    const there = await published();
     const ours = own ? fingerprint(unb64(own.entry.identity.public)) : null;
-    if (own && published?.fingerprint === ours) {
+    if (own && there.fingerprint === ours) {
       // The same identity: publish the current message key only if aMessage lacks it.
       const key = currentKey(own.entry);
-      if (key && published.message_key?.key_id === key.key_id) return { made: false, published: false, entry: own.entry };
-    } else if (published?.fingerprint) await replacing(published.fingerprint);
+      if (key && there.keys?.message_key?.key_id === key.key_id) return { made: false, published: false, entry: own.entry };
+    } else if (there.fingerprint) await replacing(there.fingerprint);
     if (own) {
       let entry = own.entry;
       const key = currentKey(entry);
@@ -442,6 +455,7 @@ function keyring(ctx, client) {
     whoAmI,
     mine,
     update,
+    published,
     publish,
     rotate,
     fresh,

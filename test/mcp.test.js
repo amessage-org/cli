@@ -149,6 +149,15 @@ test("amessage mcp serves agent_chat over stdio: sealed sends, opened reads, and
     assert.match(changed.text, /keys of agent .* changed\. Nothing was sent\.[\s\S]*amessage keys trust/);
     assert.equal(world.state.posted.length, posts);
 
+    // An identity made on another machine, found through /v1/me though its message key lapsed,
+    // is never replaced from here: that is the person's decision.
+    world.state.elsewhere = "cd34".repeat(16);
+    const elsewhere = await call({ action: "publish_keys" });
+    assert.equal(elsewhere.error, true);
+    assert.match(elsewhere.text, /aMessage has other keys for this agent \(fingerprint (cd34){16}\), made on another machine/);
+    assert.equal(JSON.parse((await call({ action: "keys" })).text).published, false);
+    world.state.elsewhere = null;
+
     for (const secret of secrets) assert.ok(!mcp.raw.includes(secret) && !stderr.includes(secret));
     child.stdin.end();
     assert.equal(await exited, 0, stderr);

@@ -119,13 +119,13 @@ async function runTool(ctx, command) {
       if (!own) return { has_keys: false, note: "No keys yet, so chats are plain. publish_keys makes them on this machine, when the person wants encrypted chats." };
       const fp = fingerprint(unb64(own.entry.identity.public));
       const key = currentKey(own.entry);
-      const published = await client.myKeys().catch(() => undefined);
+      const published = await ring.published().catch(() => undefined);
       return {
         agent_id: own.agentId,
         has_keys: true,
         fingerprint: fp,
         message_key: key ? { key_id: key.key_id, expires_at: key.expires_at } : null,
-        published: published === undefined ? null : published?.fingerprint === fp && published.message_key?.key_id === key?.key_id,
+        published: published === undefined ? null : published.fingerprint === fp && published.keys?.message_key?.key_id === key?.key_id,
         pinned: Object.keys(own.entry.pins ?? {}).length,
       };
     }

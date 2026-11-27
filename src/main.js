@@ -11,13 +11,16 @@ import {
   credentialsFile,
   forgetCredentials,
   forgetVerification,
+  keysFile,
   loadCredentials,
   loadVerification,
   saveCredentials,
   saveVerification,
+  sentFile,
   setting,
   verificationFile,
 } from "./config.js";
+import { E2EError } from "./keyring.js";
 import { clean, moment, palette } from "./output.js";
 
 export const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -153,6 +156,10 @@ export async function main(argv, io = {}) {
     home,
     fetch: send,
     api,
+    keysFile: keysFile(env, home),
+    sentFile: sentFile(env, home),
+    stdin,
+    stdout,
     web: setting(env, "WEB_URL").replace(/\/+$/, "") || (api === DEFAULT_API ? DEFAULT_WEB : null),
     skillWeb: setting(env, "WEB_URL").replace(/\/+$/, "") || DEFAULT_WEB,
     json: !!opts.json,
@@ -171,6 +178,7 @@ export async function main(argv, io = {}) {
     out: (line = "") => write(stdout, line),
     hint: (line) => write(ctx.json ? stderr : stdout, c.dim(line)),
     warn: (line) => write(stderr, c.yellow(line)),
+    note: (line) => write(stderr, c.dim(line)),
     printJson: (value) => write(stdout, JSON.stringify(value, null, 2)),
     async readStdin() {
       let text = "";
@@ -187,6 +195,10 @@ export async function main(argv, io = {}) {
       prompt.close();
       const yes = answer ? answer === "y" || answer === "yes" : preferYes;
       if (!yes) throw new Cancelled("Nothing changed.");
+    },
+    async secret(question) {
+      if (!interactive) throw new UsageError("Set AMESSAGE_KEYS_PASSPHRASE, or run this in a terminal to type the passphrase.");
+      return hiddenAnswer(/** @type {import("node:tty").ReadStream} */ (/** @type {unknown} */ (stdin)), stderr, question);
     },
     credentials,
     async connect({ primary = false, name = undefined } = {}) {
@@ -232,7 +244,8 @@ export async function main(argv, io = {}) {
   try {
     await command.run(ctx, args, opts);
     const current = ctx.skillCurrent;
-    if (!ctx.json && current) await noteNewerSkill(ctx, current);
+    // A command that speaks a protocol on stdout (amessage mcp) gets no notes added after it.
+    if (!ctx.json && current && !command.stdio) await noteNewerSkill(ctx, current);
     return 0;
   } catch (error) {
     return report(ctx, stderr, error, commandName);
@@ -242,14 +255,16 @@ export async function main(argv, io = {}) {
 /**
  * @typedef {{
  *   env: NodeJS.ProcessEnv, cwd: string, home: string, fetch: typeof fetch,
- *   api: string, web: string | null, skillWeb: string,
+ *   api: string, web: string | null, skillWeb: string, keysFile: string, sentFile: string,
+ *   stdin: NodeJS.ReadableStream & { isTTY?: boolean }, stdout: NodeJS.WritableStream & { isTTY?: boolean },
  *   json: boolean, interactive: boolean, stdinIsTTY: boolean,
  *   c: import("./output.js").Palette, width: number, userAgent: string,
  *   readonly tokenSource: string | null, readonly skillCurrent: string | null,
  *   tilde: (path: string) => string,
- *   out: (line?: string) => void, hint: (line: string) => void, warn: (line: string) => void,
+ *   out: (line?: string) => void, hint: (line: string) => void, warn: (line: string) => void, note: (line: string) => void,
  *   printJson: (value: unknown) => void, readStdin: () => Promise<string>,
  *   confirm: (question: string, preferYes: boolean) => Promise<void>,
+ *   secret: (question: string) => Promise<string>,
  *   credentials: () => Promise<{ token: string, agent_id: string | null, source: string } | null>,
  *   connect: (options?: { primary?: boolean, name?: string }) => Promise<any>,
  *   forget: () => Promise<boolean>,
@@ -261,6 +276,36 @@ export async function main(argv, io = {}) {
  *   client: (options?: { connect?: boolean, required?: boolean }) => Promise<import("./api.js").Client>,
  * }} Context
  */
+
+/**
+ * Ask for a passphrase without showing what is typed.
+ * @param {import("node:tty").ReadStream} stdin @param {NodeJS.WritableStream} stderr @param {string} question
+ * @returns {Promise<string>}
+ */
+function hiddenAnswer(stdin, stderr, question) {
+  stderr.write(`${question} `);
+  return new Promise((resolve, reject) => {
+    let answer = "";
+    const done = () => {
+      stdin.off("data", onData);
+      stdin.setRawMode?.(false);
+      stdin.pause();
+      stderr.write("\n");
+    };
+    const onData = (/** @type {Buffer | string} */ chunk) => {
+      for (const ch of String(chunk)) {
+        if (ch === "\r" || ch === "\n" || ch === "\u0004") return done(), resolve(answer);
+        if (ch === "\u0003") return done(), reject(new Cancelled("Nothing changed."));
+        if (ch === "\u007f" || ch === "\b") answer = answer.slice(0, -1);
+        else answer += ch;
+      }
+    };
+    stdin.setRawMode?.(true);
+    stdin.setEncoding("utf8");
+    stdin.on("data", onData);
+    stdin.resume();
+  });
+}
 
 /** The command name and everything else, letting global flags come first. @param {string[]} argv */
 function splitCommand(argv) {
@@ -326,11 +371,20 @@ function report(ctx, stderr, error, command) {
       say(c.dim("Connecting again would make a separate account, so it is not a fix."));
     } else if (error.code === "account_not_linked") {
       say("Someone has to sign in to this account first. The link is in: amessage me");
+    } else if (error.code === "encrypted_chat") {
+      say(c.dim("This chat is encrypted. Send without --plain, from a machine with this agent's keys (amessage keys)."));
+    } else if (error.code === "stale_key") {
+      say(c.dim("If it happens again, the keys on this machine may not be the ones aMessage has for this agent: see amessage keys."));
     }
     if (error.retryAfter) {
       const seconds = Number(error.retryAfter);
       say(c.dim(Number.isFinite(seconds) ? `Try again in ${seconds} seconds.` : `Try again after ${clean(error.retryAfter)}.`));
     }
+    return 1;
+  }
+  if (error instanceof E2EError) {
+    say(c.red(error.message));
+    if (error.next) say(error.next);
     return 1;
   }
   const failure = /** @type {Error & { cause?: { code?: string } }} */ (error);

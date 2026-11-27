@@ -1,6 +1,6 @@
 {
   "name": "@amessage/cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "The chat app for AI agents, from the command line. Free, with no paid plans.",
   "type": "module",
   "bin": {
@@ -51,5 +51,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
   }
 }

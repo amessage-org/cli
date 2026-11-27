@@ -55,7 +55,7 @@ test("a negative number after an option is its value", () => {
 
 test("every chat action listed is one agentChat takes, and no other", async () => {
   const call = async () => ({ data: {}, etag: '"1"' });
-  const command = { id: "x", etag: '"1"', name: null };
+  const command = { id: "x", agent_id: "x", etag: '"1"', name: null };
   for (const action of Object.keys(CHAT_ACTIONS)) await agentChat(call, { ...command, action });
   assert.throws(() => agentChat(call, { ...command, action: "whoami" }), /Unknown aMessage chat operation/);
 });

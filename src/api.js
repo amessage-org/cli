@@ -37,7 +37,19 @@ export class NotConnected extends Error {
  * @typedef {{ text?: string, location?: Point | null }} BeaconInput
  * @typedef {"accepted" | "booked" | "hired" | "declined" | "spam"} Outcome
  * @typedef {{ new_contacts: "requests" | "open" | "closed", allow_from: "anyone" | "phone_or_email" | "phone" | "email" }} Preferences
+ * @typedef {{ agent_id: string } | { phone: string } | { email: string } | { conversation_id: string } | { beacon_id: string }} Recipient
+ * @typedef {{ agent_id: string, identity_key: string, fingerprint: string, message_key: import("./e2e.js").MessageKey }} AgentKeys
  */
+
+/** An answer, or null when the API says there is none (404). @param {Promise<any>} answer */
+async function orNull(answer) {
+  try {
+    return await answer;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
 
 /** @param {ClientOptions} options */
 export function createClient({ base, token = null, userAgent, fetch: send = globalThis.fetch }) {
@@ -138,9 +150,23 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
     remove: (beacon, etag) =>
       request("DELETE", `/v1/beacons/${id(beacon)}`, { headers: { "If-Match": etag }, auth: "required" }),
     /** @param {string} beacon @param {string} text @param {string} [key] */
-    message: (beacon, text, key) => chat({ action: "send", to: { beacon_id: beacon }, text, key }),
-    /** @param {{ agent_id: string } | { phone: string } | { email: string }} to @param {string} text @param {string} [key] */
-    send: (to, text, key) => chat({ action: "send", to, text, key }),
+    messageBeacon: (beacon, text, key) => chat({ action: "send", to: { beacon_id: beacon }, text, key }),
+    /**
+     * Send a message: plain `text`, or `encrypted`, an envelope sealed on this machine.
+     * @param {Recipient} to @param {{ text: string } | { encrypted: import("./e2e.js").Envelope }} body
+     * @param {{ replyTo?: string, key?: string }} [options]
+     */
+    send: (to, body, { replyTo, key } = {}) => chat({ action: "send", to, ...body, reply_to_message_id: replyTo, key }),
+    /** One message, by its id. @param {string} message */
+    message: (message) => chat({ action: "read", id: message }),
+    /** This agent's published keys, or null when it has none. */
+    myKeys: () => orNull(chat({ action: "keys" })),
+    /** @param {{ identity_key: string, message_key: import("./e2e.js").MessageKey }} keys */
+    publishKeys: (keys) => chat({ action: "publish_keys", ...keys }),
+    /** Another agent's public keys, or null when it has none. @param {string} agent */
+    agentKeys: (agent) => orNull(chat({ action: "agent_keys", agent_id: agent })),
+    /** The public keys of the agent behind a phone or email, or null. @param {{ phone: string } | { email: string }} to */
+    keyLookup: (to) => orNull(chat({ action: "key_lookup", to })),
     /** @param {"incoming" | "outgoing"} direction @param {string} [cursor] */
     requests: (direction, cursor) => chat({ action: "requests", direction, state: "pending", cursor }),
     /** @param {string} id */
@@ -159,13 +185,10 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
     readConversation: (conversation, cursor) => chat({ action: "messages", id: conversation, cursor }),
     /** Mark a conversation read through this message. @param {string} conversation @param {string} message */
     markRead: (conversation, message) => chat({ action: "mark_read", id: conversation, message_id: message }),
-    /** @param {string} conversation @param {string} text @param {string} [replyTo] @param {string} [key] */
-    reply: (conversation, text, replyTo, key) =>
-      chat({ action: "send", to: { conversation_id: conversation }, text, reply_to_message_id: replyTo, key }),
     /** @param {string} message @param {Outcome} outcome */
     mark: (message, outcome) =>
       request("PUT", `/v1/messages/${id(message)}/outcome`, { body: { outcome }, auth: "required" }),
-    /** @param {string} conversation @param {{ reason: string, block: boolean }} input @param {string} [key] */
+    /** @param {string} conversation @param {{ reason: string, block: boolean, reveal?: { message_id: string, text: string, franking_key: string }[] }} input @param {string} [key] */
     report: (conversation, input, key) => post(`/v1/conversations/${id(conversation)}/reports`, input, key),
     /** Who may start a chat with this agent, and the ETag to change it with. @returns {Promise<Preferences & { etag: string | null }>} */
     preferences: () => chat({ action: "preferences" }),

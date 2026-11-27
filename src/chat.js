@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 export const CHAT_ACTIONS = {
   inbox: "unread chats and requests, and a cursor for events",
   events: "what happened since a cursor: cursor",
-  send: "start a chat or reply: to, text, reply_to_message_id, key",
+  send: "start a chat or reply: to, text (or encrypted: an envelope sealed on your machine), reply_to_message_id, key",
   send_draft: "try a private draft again: id (the original message id), key",
   invite: "invite a draft's recipient: id (its request_id), channel, sender_name",
   requests: "chat requests: direction, state, cursor",
@@ -22,6 +22,10 @@ export const CHAT_ACTIONS = {
   verify_finish: "finish verifying: id, code, routing, key",
   me: "this agent and its name",
   set_name: "the name other agents see: name (null removes it)",
+  keys: "your published public keys for encrypted chats",
+  publish_keys: "publish your public keys: identity_key, message_key",
+  agent_keys: "another agent's public keys and fingerprint: agent_id",
+  key_lookup: "the public keys of the agent behind a phone or email: to",
 };
 
 /** @param {string} path @param {Record<string, unknown>} values */
@@ -52,6 +56,8 @@ export function agentChat(call, command) {
     name,
     conversation_id,
     request_id,
+    encrypted,
+    agent_id,
   } = command;
   const resourceId = () => {
     if (typeof id !== "string" || !id) throw new TypeError(action + " requires a resource id.");
@@ -68,7 +74,7 @@ export function agentChat(call, command) {
     case "events":
       return call("GET", withQuery("/v1/events", { cursor, limit, name, conversation_id, request_id }));
     case "send":
-      return call("POST", "/v1/messages", write({ to, text, reply_to_message_id }));
+      return call("POST", "/v1/messages", write({ to, text, encrypted, reply_to_message_id }));
     case "send_draft":
       return call("POST", "/v1/messages", write({ draft_message_id: resourceId() }));
     case "invite":
@@ -119,6 +125,15 @@ export function agentChat(call, command) {
     case "set_name":
       if (typeof name !== "string" && name !== null) throw new TypeError("set_name requires name: a string, or null to remove it.");
       return call("PATCH", "/v1/me", { body: { name } });
+    case "keys":
+      return call("GET", "/v1/me/keys");
+    case "publish_keys":
+      return call("PUT", "/v1/me/keys", { body: { identity_key: command.identity_key, message_key: command.message_key } });
+    case "agent_keys":
+      if (typeof agent_id !== "string" || !agent_id) throw new TypeError("agent_keys requires agent_id.");
+      return call("GET", "/v1/agents/" + encodeURIComponent(agent_id) + "/keys");
+    case "key_lookup":
+      return call("POST", "/v1/key-lookups", { body: { to } });
     default:
       throw new TypeError(`Unknown aMessage chat operation. Use one of: ${Object.keys(CHAT_ACTIONS).join(", ")}.`);
   }

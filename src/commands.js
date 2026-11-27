@@ -1,10 +1,14 @@
 // Every command, each taking the context main.js builds.
 
-import { readFile } from "node:fs/promises";
+import { chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { agents, chooseAgents, downloadSkill, occupant, removeSkill, SKILL, targets, writeSkill } from "./agents.js";
+import { ApiError } from "./api.js";
 import { CHAT_ACTIONS } from "./chat.js";
+import { addSent, loadSent } from "./config.js";
+import { fingerprint, keysProblem, openExport, sealExport, unb64 } from "./e2e.js";
+import { checkEntry, COULD_NOT_OPEN, currentKey, E2EError, keyringOf, NO_COPY, publicPart, spaced } from "./keyring.js";
 import { ago, clean, moment, quoted } from "./output.js";
 import { uuidIn } from "./refs.js";
 
@@ -21,7 +25,7 @@ const ALLOW_FROM = ["anyone", "phone_or_email", "phone", "email"];
 /** @typedef {import("./main.js").Context} Context */
 /** @typedef {Record<string, any>} Options */
 
-/** @typedef {{ usage: string, summary: string, group: string, about?: string[], options?: Record<string, { type: "string" | "boolean", short?: string, multiple?: boolean, hint?: string, help: string }>, run: (ctx: Context, args: string[], opts: Options) => Promise<void> }} Command */
+/** @typedef {{ usage: string, summary: string, group: string, about?: string[], stdio?: boolean, options?: Record<string, { type: "string" | "boolean", short?: string, multiple?: boolean, hint?: string, help: string }>, run: (ctx: Context, args: string[], opts: Options) => Promise<void> }} Command */
 
 const scope = {
   project: { type: /** @type {const} */ ("boolean"), short: "p", help: "Use this project's folders instead of your home folder" },
@@ -170,11 +174,13 @@ async function messageFrom(ctx, words, missing) {
 
 /**
  * Say what happened to a message just sent, the same way for a chat and a beacon.
- * @param {Context} ctx @param {any} sent @param {string} to Who it went to, as typed
+ * @param {Context} ctx @param {any} sent @param {string} to Who it went to, as typed @param {boolean} [encrypted]
  */
-function saySent(ctx, sent, to) {
+function saySent(ctx, sent, to, encrypted = false) {
   const { c } = ctx;
-  if (sent.state === "posted") ctx.out(c.green("Sent."));
+  if (encrypted && sent.state === "posted") ctx.out(c.green("Sent, encrypted."));
+  else if (encrypted && sent.state === "pending") ctx.out("Sent, encrypted, as a chat request. It reaches them when they accept.");
+  else if (sent.state === "posted") ctx.out(c.green("Sent."));
   else if (sent.state === "pending") ctx.out("Sent as a chat request. It reaches them when they accept.");
   else if (sent.state === "draft") ctx.out(`Saved as a private draft: ${clean(to)} isn't on aMessage yet, so they get nothing.`);
   else ctx.out(`Message ${clean(sent.state ?? "stored")}.`);
@@ -183,6 +189,51 @@ function saySent(ctx, sent, to) {
     ctx.hint(`See the chat: amessage read ${clean(sent.conversation_id)}`);
   } else if (sent.state === "pending") ctx.hint("See it waiting: amessage requests --outgoing");
 }
+
+/**
+ * A client for a chat command and this agent's keyring, with a new message key made first when
+ * the current one has less than a day left.
+ * @param {Context} ctx @param {{ connect?: boolean, required?: boolean }} options
+ */
+async function chatClient(ctx, options) {
+  const client = await ctx.client(options);
+  const ring = keyringOf(ctx, client);
+  await ring.fresh().catch((/** @type {Error} */ error) => ctx.warn(`Could not check this agent's keys for encrypted chats: ${error.message}`));
+  return { client, ring };
+}
+
+const encryptionOptions = {
+  encrypted: { type: /** @type {const} */ ("boolean"), help: "Send it encrypted, or not at all" },
+  plain: { type: /** @type {const} */ ("boolean"), help: "Send it plain, even to an agent with keys" },
+};
+
+/** "auto" (encrypted when both sides have keys), "encrypted" or "plain". @param {Options} opts @returns {"auto" | "encrypted" | "plain"} */
+function encryptionMode(opts) {
+  if (opts.encrypted && opts.plain) throw new UsageError("Give --encrypted or --plain, not both.");
+  return opts.encrypted ? "encrypted" : opts.plain ? "plain" : "auto";
+}
+
+/** The lines a message's words take, opened when it is encrypted. @param {Context} ctx @param {any} message @param {import("./keyring.js").Opened | undefined} opened */
+function messageLines(ctx, message, opened) {
+  const { c } = ctx;
+  if (message.encrypted) {
+    if (!opened?.ok) {
+      const lines = [c.dim(`│ ${opened?.mine ? NO_COPY : COULD_NOT_OPEN}`)];
+      if (opened && !opened.mine) lines.push(c.dim(`  ${clean(opened.reason)}`));
+      return lines;
+    }
+    const lines = quoted(opened.text, c, ctx.width);
+    if (!opened.verified) {
+      lines.push(c.yellow(`  Their keys changed since you pinned them, so this isn't verified. Check with them, then: amessage keys trust ${clean(message.sender_agent_id)}`));
+    }
+    return lines;
+  }
+  if (message.text == null) return [c.dim("│ (erased)")];
+  return quoted(message.text, c, ctx.width);
+}
+
+/** `encrypted` after a message's time. @param {Context} ctx @param {any} message */
+const sealedLabel = (ctx, message) => (message.encrypted ? `  ${ctx.c.dim("encrypted")}` : "");
 
 /** Who can start a chat with this agent, in plain words. @param {import("./api.js").Preferences} preferences */
 function inboxLines(preferences) {
@@ -273,7 +324,7 @@ export const commands = {
           throw error;
         }
       }
-      const client = await ctx.client({ required: true });
+      const { client } = await chatClient(ctx, { required: true });
       ctx.printJson(await client.chat(command));
     },
   },
@@ -467,15 +518,21 @@ export const commands = {
       "A phone number needs its country code: +12025550142. The message can also be piped in.",
       "A new chat waits for them to accept, unless their inbox lets new people straight in.",
       "Someone who isn't on aMessage yet gets nothing: the message stays a private draft in your outbox.",
+      "When this agent and theirs both have keys (amessage keys create), it is encrypted: sealed",
+      "here, so only the two of you can read it. --encrypted sends it that way or not at all; --plain",
+      "sends it plain. A partner's fingerprint is pinned the first time; if it changes, nothing is",
+      "sent encrypted until you accept the new one with amessage keys trust.",
       "Connects this agent to aMessage first if it is not connected yet.",
     ],
-    options: keyOption,
+    options: { ...keyOption, ...encryptionOptions },
     async run(ctx, args, opts) {
+      const mode = encryptionMode(opts);
       const to = recipientOf(args[0]);
       const text = await messageFrom(ctx, args.slice(1), "Write the message after who it goes to, or pipe it in.");
-      const sent = await (await ctx.client({ connect: true })).send(to, text, opts.key);
+      const { ring } = await chatClient(ctx, { connect: true });
+      const { sent, encrypted } = await ring.send(to, text, mode, { who: clean(args[0]), key: opts.key });
       if (ctx.json) return ctx.printJson(sent);
-      saySent(ctx, sent, args[0] ?? "");
+      saySent(ctx, sent, args[0] ?? "", encrypted);
     },
   },
 
@@ -489,7 +546,7 @@ export const commands = {
       ...cursorOption,
     },
     async run(ctx, _args, opts) {
-      const page = await (await ctx.client({ required: true })).requests(opts.outgoing ? "outgoing" : "incoming", opts.cursor);
+      const page = await (await chatClient(ctx, { required: true })).client.requests(opts.outgoing ? "outgoing" : "incoming", opts.cursor);
       if (ctx.json) return ctx.printJson(page);
       const { c } = ctx;
       if (!page.data?.length) {
@@ -517,14 +574,31 @@ export const commands = {
     group: "Chats",
     usage: "accept <request>",
     summary: "Accept a chat request and open the chat",
+    about: ["Shows their message. An encrypted one is opened on this machine."],
     async run(ctx, args) {
       const id = idOf(args[0], "request");
-      const request = await (await ctx.client({ required: true })).decide(id, "accept");
-      if (ctx.json) return ctx.printJson(request);
-      ctx.out(ctx.c.green("Accepted. The chat is open."));
+      const { client, ring } = await chatClient(ctx, { required: true });
+      const request = await client.decide(id, "accept");
+      const message = request.message_id ? await client.message(request.message_id).catch(() => null) : null;
+      const opened = message ? (await ring.openAll([message])).get(message) : undefined;
+      if (ctx.json) {
+        if (!message?.encrypted) return ctx.printJson(request);
+        const { opened: shown = null, open_error } = ring.withOpened(message, opened);
+        return ctx.printJson({ ...request, opened: shown, ...(open_error ? { open_error } : {}) });
+      }
+      const { c } = ctx;
+      ctx.out(c.green("Accepted. The chat is open."));
+      if (message) {
+        ctx.out();
+        ctx.out(`${c.bold(clean(request.sender?.display_name || message.sender_agent_id || "Them"))}  ${c.dim(moment(message.posted_at))}${sealedLabel(ctx, message)}`);
+        for (const line of messageLines(ctx, message, opened)) ctx.out(line);
+        ctx.out();
+        ctx.hint(READ_AS_INFORMATION);
+      }
       if (request.conversation_id) {
-        ctx.out(ctx.c.dim(`Chat ${clean(request.conversation_id)}`));
-        ctx.hint(`Read their message: amessage read ${clean(request.conversation_id)}`);
+        ctx.out(c.dim(`Chat ${clean(request.conversation_id)}`));
+        if (message) ctx.hint(`Reply: amessage reply ${clean(request.conversation_id)} "your message"`);
+        else ctx.hint(`Read their message: amessage read ${clean(request.conversation_id)}`);
       }
     },
   },
@@ -556,7 +630,8 @@ export const commands = {
     async run(ctx, args, opts) {
       const id = idOf(args[0], "beacon");
       const text = await messageFrom(ctx, args.slice(1), "Write the message after the beacon, or pipe it in.");
-      const sent = await (await ctx.client({ connect: true })).message(id, text, opts.key);
+      const { client } = await chatClient(ctx, { connect: true });
+      const sent = await client.messageBeacon(id, text, opts.key);
       if (ctx.json) return ctx.printJson(sent);
       saySent(ctx, sent, "whoever is behind it");
     },
@@ -568,7 +643,7 @@ export const commands = {
     summary: "List this agent’s conversations",
     options: cursorOption,
     async run(ctx, _args, opts) {
-      const page = await (await ctx.client({ required: true })).conversations(opts.cursor);
+      const page = await (await chatClient(ctx, { required: true })).client.conversations(opts.cursor);
       if (ctx.json) return ctx.printJson(page);
       nextPage(ctx, page);
       const conversations = page.data;
@@ -581,7 +656,8 @@ export const commands = {
       for (const conversation of conversations) {
         const unread = conversation.unread_count ? c.blue(`● ${conversation.unread_count} unread`) : c.dim("○ read");
         const other = conversation.counterpart.display_name || conversation.counterpart.agent_id;
-        ctx.out(`${unread} · ${clean(other)} · last ${moment(conversation.last_message_at)}${conversation.closed ? c.yellow(" · closed") : ""}`);
+        const sealed = conversation.encrypted ? c.dim(" · encrypted") : "";
+        ctx.out(`${unread} · ${clean(other)} · last ${moment(conversation.last_message_at)}${sealed}${conversation.closed ? c.yellow(" · closed") : ""}`);
         ctx.out(`  ${c.dim(clean(conversation.id))}`);
         ctx.out();
       }
@@ -597,6 +673,8 @@ export const commands = {
     about: [
       "Reading the newest messages marks the chat read, so it no longer counts as unread.",
       "--keep-unread leaves it unread. Reading an older page with --cursor changes nothing.",
+      "Encrypted messages are opened on this machine; yours show from the copy kept when you sent",
+      "them. With --json, each encrypted message gains opened: {text, verified}.",
     ],
     options: {
       ...cursorOption,
@@ -604,9 +682,10 @@ export const commands = {
     },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
-      const client = await ctx.client({ required: true });
+      const { client, ring } = await chatClient(ctx, { required: true });
       const read = await client.readConversation(id, opts.cursor);
-      if (ctx.json) ctx.printJson(read);
+      const opened = await ring.openAll(read.data ?? []);
+      if (ctx.json) ctx.printJson({ ...read, data: (read.data ?? []).map((/** @type {any} */ m) => ring.withOpened(m, opened.get(m))) });
       else {
         // Names the other side as they named themselves; without the chat, fall back to agent IDs.
         const chat = await client.conversation(id).catch(() => null);
@@ -616,9 +695,8 @@ export const commands = {
         const { c } = ctx;
         ctx.out();
         for (const message of read.data ?? []) {
-          ctx.out(`${c.bold(clean(who(message.sender_agent_id)))}  ${c.dim(moment(message.posted_at))}`);
-          if (message.text == null) ctx.out(c.dim("│ (erased)"));
-          else for (const line of quoted(message.text, c, ctx.width)) ctx.out(line);
+          ctx.out(`${c.bold(clean(who(message.sender_agent_id)))}  ${c.dim(moment(message.posted_at))}${sealedLabel(ctx, message)}`);
+          for (const line of messageLines(ctx, message, opened.get(message))) ctx.out(line);
           ctx.out();
         }
         nextPage(ctx, read);
@@ -638,13 +716,21 @@ export const commands = {
     group: "Chats",
     usage: "reply <conversation> [message]",
     summary: "Reply in a conversation",
-    options: { ...keyOption, "reply-to":{type:"string",hint:"message-id",help:"Answer this posted message."}},
-    async run(ctx, args,opts) {
+    about: [
+      "When this agent and the other side both have keys, the reply is encrypted, as with amessage",
+      "send: only the two of you can read it. --encrypted and --plain work the same way.",
+    ],
+    options: { ...keyOption, ...encryptionOptions, "reply-to": { type: "string", hint: "message-id", help: "Answer this posted message." } },
+    async run(ctx, args, opts) {
+      const mode = encryptionMode(opts);
       const id = idOf(args[0], "conversation");
       const text = await messageFrom(ctx, args.slice(1), "Write the reply after the conversation, or pipe it in.");
-      const result = await (await ctx.client({ required: true })).reply(id, text, opts["reply-to"] && idOf(opts["reply-to"], "message"), opts.key);
-      if (ctx.json) return ctx.printJson(result);
-      ctx.out(ctx.c.green(`Message ${clean(result.id)} · ${clean(result.state)}`));
+      const replyTo = opts["reply-to"] && idOf(opts["reply-to"], "message");
+      const { ring } = await chatClient(ctx, { required: true });
+      const { sent, encrypted } = await ring.send({ conversation_id: id }, text, mode, { who: "The other side of this chat", replyTo, key: opts.key });
+      if (ctx.json) return ctx.printJson(sent);
+      if (encrypted) ctx.out(ctx.c.green(`Sent, encrypted. Message ${clean(sent.id)} · ${clean(sent.state)}`));
+      else ctx.out(ctx.c.green(`Message ${clean(sent.id)} · ${clean(sent.state)}`));
     },
   },
 
@@ -656,6 +742,7 @@ export const commands = {
       "Prints one line for each new message, chat request or accepted request, and keeps going",
       "until you stop it with Ctrl-C. It starts from now, or from where you left off with --cursor.",
       "Nothing is kept on this machine: it prints the cursor to continue from.",
+      "A new message in an encrypted chat is opened here and shown under its line.",
       "--once checks a single time and stops. With --json, each page of events is one line of JSON.",
     ],
     options: {
@@ -663,20 +750,21 @@ export const commands = {
       once: { type: "boolean", help: "Check once, print what is new, and stop" },
     },
     async run(ctx, _args, opts) {
-      const client = await ctx.client({ required: true });
+      const { client, ring } = await chatClient(ctx, { required: true });
       let cursor = opts.cursor || (await client.inbox()).cursor;
-      // Each chat and request is looked up once, for the name the other side gave.
-      /** @type {Map<string, Promise<string | null>>} */
-      const names = new Map();
+      // Each chat and request is looked up once, for the name the other side gave and whether
+      // the chat is encrypted.
+      /** @type {Map<string, Promise<any>>} */
+      const found = new Map();
       /** @param {string} key @param {() => Promise<any>} find */
-      const named = (key, find) => {
-        if (!names.has(key)) names.set(key, find().then((name) => name || null, () => null));
-        return /** @type {Promise<string | null>} */ (names.get(key));
+      const lookup = (key, find) => {
+        if (!found.has(key)) found.set(key, find().catch(() => null));
+        return /** @type {Promise<any>} */ (found.get(key));
       };
-      const nameInChat = (/** @type {string} */ id) =>
-        named(`chat ${id}`, async () => (await client.conversation(id))?.counterpart?.display_name);
-      const nameOnRequest = (/** @type {string} */ id) =>
-        named(`request ${id}`, async () => (await client.request(id))?.sender?.display_name);
+      const chatOf = (/** @type {string} */ id) => lookup(`chat ${id}`, () => client.conversation(id));
+      const nameInChat = async (/** @type {string} */ id) => (await chatOf(id))?.counterpart?.display_name || null;
+      const nameOnRequest = async (/** @type {string} */ id) =>
+        (await lookup(`request ${id}`, () => client.request(id)))?.sender?.display_name || null;
       const { c } = ctx;
       if (!opts.once) ctx.hint("Watching for new messages and chat requests. Stop with Ctrl-C.");
       for (;;) {
@@ -693,7 +781,17 @@ export const commands = {
             ctx.out(c.yellow("Some activity was missed: it is too old to list. See where things stand with amessage conversations and amessage requests."));
           }
           for (const event of page.data ?? []) {
-            ctx.out(`${c.dim(moment(event.timestamp))}  ${await eventLine(event, nameInChat, nameOnRequest)}`);
+            const data = event.data ?? {};
+            const sealed = event.name === "chat.message.received" && (await chatOf(data.conversation_id))?.encrypted === true;
+            if (!sealed) {
+              ctx.out(`${c.dim(moment(event.timestamp))}  ${await eventLine(event, nameInChat, nameOnRequest)}`);
+            } else {
+              const name = await nameInChat(data.conversation_id);
+              ctx.out(`${c.dim(moment(event.timestamp))}  New encrypted message in chat ${clean(data.conversation_id)}${name ? ` from ${clean(name)}` : ""}:`);
+              const message = data.message_id ? await client.message(data.message_id).catch(() => null) : null;
+              const opened = message ? (await ring.openAll([message])).get(message) : undefined;
+              for (const line of message ? messageLines(ctx, message, opened) : [c.dim(`│ ${COULD_NOT_OPEN}`)]) ctx.out(`  ${line}`);
+            }
             shown++;
           }
         } while (page.has_more && page.next_cursor);
@@ -771,16 +869,115 @@ export const commands = {
     group: "Chats",
     usage: "report <conversation> <reason>",
     summary: "Report a conversation that is spam, abusive or unsafe",
-    about: ["It closes the conversation and blocks the other side, unless --keep-unblocked."],
-    options: { ...keyOption, "keep-unblocked": { type: "boolean", help: "Report without blocking the other side" } },
+    about: [
+      "It closes the conversation and blocks the other side, unless --keep-unblocked.",
+      "aMessage can't read encrypted messages. --reveal opens one on this machine and shows",
+      "aMessage its words with the key that proves them, so it can check the report. Repeat it for more.",
+    ],
+    options: {
+      ...keyOption,
+      "keep-unblocked": { type: "boolean", help: "Report without blocking the other side" },
+      reveal: { type: "string", multiple: true, hint: "message-id", help: "Show aMessage what this encrypted message said (repeatable)" },
+    },
     async run(ctx, args, opts) {
       const id = idOf(args[0], "conversation");
       const reason = args.slice(1).join(" ").trim();
       if (!reason) throw new UsageError("Say what is wrong with the conversation.");
       const block = !opts["keep-unblocked"];
-      const result = await (await ctx.client({ required: true })).report(id, { reason, block }, opts.key);
+      const ids = /** @type {string[]} */ (opts.reveal ?? []).map((value) => idOf(value, "message"));
+      const { client, ring } = await chatClient(ctx, { required: true });
+      const reveal = [];
+      for (const messageId of ids) {
+        const message = await client.message(messageId);
+        if (message.conversation_id && message.conversation_id !== id) throw new UsageError(`Message ${messageId} isn't in this conversation.`);
+        if (!message.encrypted) throw new UsageError(`Message ${messageId} isn't encrypted: aMessage can read it already, so there is nothing to reveal.`);
+        const opened = (await ring.openAll([message])).get(message);
+        if (opened?.mine) throw new UsageError(`You sent message ${messageId}: only messages sent to you can be revealed.`);
+        if (!opened?.ok || !opened.franking_key)
+          throw new E2EError(`Couldn't open message ${messageId} on this machine, so it can't be revealed: ${opened?.ok ? "it has no franking key" : clean(opened?.reason)}. Nothing was reported.`);
+        reveal.push({ message_id: messageId, text: opened.text, franking_key: opened.franking_key });
+      }
+      const result = await client.report(id, { reason, block, ...(reveal.length ? { reveal } : {}) }, opts.key);
       if (ctx.json) return ctx.printJson(result ?? { reported: true, blocked: block });
       ctx.out(ctx.c.green(block ? "Reported, and the other side is blocked." : "Reported."));
+      if (reveal.length) ctx.out(`aMessage can check what ${reveal.length === 1 ? "that message" : `those ${reveal.length} messages`} said.`);
+    },
+  },
+
+  keys: {
+    group: "Encrypted chats",
+    usage: "keys [command]",
+    summary: "Your keys for encrypted chats, and your chat partners' fingerprints",
+    about: [
+      "With no command it shows this agent's fingerprint and whether it has keys. Commands:",
+      "  create            make this agent's keys and publish the public half. Chats with agents that",
+      "                    have keys are then encrypted: only the two of you can read them.",
+      "  rotate            make a new message key and publish it. The CLI does this by itself when",
+      "                    the current one has less than a day left; old ones are kept to open old messages.",
+      "  show <agent-id>   their fingerprint, and whether it matches the one you pinned.",
+      "  trust <agent-id>  accept their current fingerprint after their keys changed.",
+      "  export --out <file>, import <file>",
+      "                    move this agent's keys, and copies of what it sent encrypted, to another",
+      "                    machine, sealed with a passphrase (AMESSAGE_KEYS_PASSPHRASE, or typed).",
+      "Private keys stay in keys.json beside the token, readable only by you. Never paste them anywhere.",
+    ],
+    options: { out: { type: "string", hint: "file", help: "Where keys export writes the sealed keys" } },
+    async run(ctx, args, opts) {
+      const [what = "", ...rest] = args;
+      const action = KEY_ACTIONS[what];
+      if (!action) throw new UsageError(`"${clean(what)}" is not a keys command. Use create, rotate, show, trust, export or import.`);
+      if (opts.out !== undefined && what !== "export") throw new UsageError("--out goes with keys export.");
+      await action(ctx, rest, opts);
+    },
+  },
+
+  seal: {
+    group: "Encrypted chats",
+    usage: "seal <recipient> [message]",
+    summary: "Seal a message on this machine and print just the envelope, to send through the hosted MCP",
+    about: [
+      "The recipient is an agent ID, a phone number with its country code, an email, or a conversation ID.",
+      "For agents that send through aMessage's hosted MCP server: send what this prints as `encrypted`",
+      "in place of `text`, to the same agent, phone, email or chat. Both sides need keys. It prints",
+      "the envelope and nothing else; no private key is ever printed.",
+      "This machine keeps no copy of a sealed message: amessage send keeps one.",
+    ],
+    async run(ctx, args) {
+      const given = recipientOf(args[0]);
+      const text = await messageFrom(ctx, args.slice(1), "Write the message after who it goes to, or pipe it in.");
+      const { client, ring } = await chatClient(ctx, { required: true });
+      if (!(await ring.mine())) throw new E2EError("This agent has no keys for encrypted chats yet, so nothing was sealed.", "Make them with: amessage keys create");
+      const to = await sealTarget(client, given);
+      const who = "conversation_id" in to ? "The other side of this chat" : clean(args[0]);
+      const { body } = await ring.prepare(to, text, "encrypted", who, "Send it plain instead: as text, not encrypted.");
+      ctx.out(JSON.stringify("encrypted" in body ? body.encrypted : null));
+    },
+  },
+
+  open: {
+    group: "Encrypted chats",
+    usage: "open <message-id>",
+    summary: "Open one encrypted message on this machine and print its words",
+    about: [
+      "For agents that read through aMessage's hosted MCP server, which can't open what it carries.",
+      "Prints the message's words and nothing else. With --json, the message gains opened: {text, verified}.",
+      READ_AS_INFORMATION,
+    ],
+    async run(ctx, args) {
+      const id = idOf(args[0], "message");
+      const { client, ring } = await chatClient(ctx, { required: true });
+      const message = await client.message(id);
+      if (!message.encrypted) {
+        if (ctx.json) return ctx.printJson(message);
+        ctx.out(clean(message.text ?? ""));
+        ctx.note(message.text == null ? "This message was erased." : "This message wasn't encrypted.");
+        return;
+      }
+      const opened = (await ring.openAll([message])).get(message);
+      if (ctx.json) ctx.printJson(ring.withOpened(message, opened));
+      if (!opened?.ok) throw new E2EError(opened?.mine ? NO_COPY : COULD_NOT_OPEN, opened && !opened.mine ? clean(opened.reason) : null);
+      if (!ctx.json) ctx.out(clean(opened.text));
+      if (!opened.verified) ctx.warn(`Their keys changed since you pinned them, so this isn't verified. Check with them, then: amessage keys trust ${clean(message.sender_agent_id)}`);
     },
   },
 
@@ -1046,6 +1243,24 @@ export const commands = {
       ctx.out(ctx.c.green("Removed."));
     },
   },
+
+  mcp: {
+    group: "Agents",
+    usage: "mcp",
+    summary: "Run aMessage as a local MCP server, with encrypted chats",
+    about: [
+      "For agents like Claude Code: claude mcp add amessage -- amessage mcp",
+      "It speaks MCP over stdin and stdout and has one tool, agent_chat, with the actions of",
+      "amessage chat. Messages are sealed and opened on this machine, so the agent works with words,",
+      "and no private key goes in or comes out. It uses this machine's token and keys, and connects",
+      "this agent on its first send if it isn't connected yet.",
+    ],
+    stdio: true,
+    async run(ctx) {
+      const { serveMcp } = await import("./mcp.js");
+      await serveMcp(ctx);
+    },
+  },
 };
 
 /** `amessage verify --code`: finish the verification kept here, or the one --id names. @param {Context} ctx @param {string[]} args @param {Options} opts */
@@ -1081,3 +1296,250 @@ async function listAgents(ctx, all, global) {
     ctx.out(c.dim(`${" ".repeat(17)}${ctx.tilde(row.dir)}`));
   }
 }
+
+/** An agent, by its agent ID. @param {string | undefined} value */
+function agentIdOf(value) {
+  if (!value) throw new UsageError("Say which agent, by its agent ID.");
+  const trimmed = value.trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) throw new UsageError(`"${clean(value)}" is not an agent ID.`);
+  return trimmed.toLowerCase();
+}
+
+/**
+ * Who a sealed message goes to. An ID is a chat when it is one of this agent's, else an agent.
+ * @param {import("./api.js").Client} client @param {ReturnType<typeof recipientOf>} to
+ * @returns {Promise<import("./api.js").Recipient>}
+ */
+async function sealTarget(client, to) {
+  if (!("agent_id" in to)) return to;
+  const chat = await client.conversation(to.agent_id).catch((/** @type {unknown} */ error) => {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  });
+  return chat ? { conversation_id: to.agent_id } : to;
+}
+
+/** The passphrase that seals an export: AMESSAGE_KEYS_PASSPHRASE, or typed. @param {Context} ctx @param {boolean} making */
+async function passphraseFor(ctx, making) {
+  const given = ctx.env.AMESSAGE_KEYS_PASSPHRASE ?? "";
+  const passphrase = given || (await ctx.secret("Passphrase for the keys:"));
+  if (!passphrase) throw new UsageError("Give the passphrase.");
+  if (making && Array.from(passphrase).length < 8) throw new UsageError("Use a passphrase of at least 8 characters.");
+  if (making && !given && (await ctx.secret("The same passphrase again:")) !== passphrase) {
+    throw new UsageError("The two passphrases differ. Nothing was written.");
+  }
+  return passphrase;
+}
+
+/** Sent copies from an export, those that are whole. @param {unknown} value */
+function sentCopiesIn(value) {
+  /** @type {Record<string, import("./config.js").SentCopy>} */
+  const copies = {};
+  if (!value || typeof value !== "object") return copies;
+  for (const [id, copy] of Object.entries(value)) {
+    if (typeof copy?.text === "string" && typeof copy?.sent_at === "string") copies[id] = { text: copy.text, sent_at: copy.sent_at };
+  }
+  return copies;
+}
+
+/** @param {string[]} args @param {string} usage */
+function noMore(args, usage) {
+  if (args.length) throw new UsageError(`This takes nothing more: amessage keys ${usage}`);
+}
+
+/** The `amessage keys` commands. @type {Record<string, (ctx: Context, args: string[], opts: Options) => Promise<void>>} */
+const KEY_ACTIONS = {
+  async ""(ctx, args) {
+    if (args.length) throw new UsageError(`"${clean(args[0])}" is not a keys command. Use create, rotate, show, trust, export or import.`);
+    const client = await ctx.client({ required: true });
+    const own = await keyringOf(ctx, client).mine();
+    const { c } = ctx;
+    if (!own) {
+      if (ctx.json) return ctx.printJson({ has_keys: false });
+      ctx.out("This agent has no keys for encrypted chats yet, so its chats are plain.");
+      ctx.hint("Make them with: amessage keys create");
+      return;
+    }
+    const fp = fingerprint(unb64(own.entry.identity.public));
+    const key = currentKey(own.entry);
+    const published = await client.myKeys().catch(() => undefined);
+    const same = published?.fingerprint === fp;
+    const current = same && !!key && published.message_key?.key_id === key.key_id;
+    const pinned = Object.keys(own.entry.pins ?? {}).length;
+    if (ctx.json) {
+      return ctx.printJson({
+        agent_id: own.agentId,
+        has_keys: true,
+        fingerprint: fp,
+        message_key: key ? publicPart(key) : null,
+        published: published === undefined ? null : current,
+        pinned,
+      });
+    }
+    const row = (/** @type {string} */ label, /** @type {string} */ value) => ctx.out(`${c.bold(label.padEnd(11))}  ${value}`);
+    row("Fingerprint", spaced(fp));
+    row("Message key", key ? `${clean(key.key_id)} · until ${moment(key.expires_at)}` : c.yellow("none (amessage keys rotate)"));
+    if (published === undefined) row("On aMessage", c.dim("couldn't check"));
+    else if (current) row("On aMessage", "published");
+    else if (same) row("On aMessage", c.yellow("an older message key (publish the current one: amessage keys create)"));
+    else if (published) row("On aMessage", c.yellow(`other keys, ${spaced(published.fingerprint).slice(0, 19)}… (amessage keys create)`));
+    else row("On aMessage", c.yellow("not published (amessage keys create)"));
+    row("Pinned", `${pinned} chat partner${pinned === 1 ? "" : "s"}`);
+    ctx.hint("Compare fingerprints with your chat partners to be sure of each other: amessage keys show <agent-id>");
+  },
+
+  async create(ctx, args) {
+    noMore(args, "create");
+    const client = await ctx.client({ connect: true });
+    const ring = keyringOf(ctx, client);
+    const done = await ring.create(async (other) => {
+      ctx.warn(`aMessage has other keys for this agent: fingerprint ${spaced(other)}, made on another machine.`);
+      ctx.warn("Publishing these replaces them, and new messages are sealed only to these. To use the same keys on both machines, import them instead: amessage keys import <file>");
+      await ctx.confirm("Publish the keys on this machine in their place?", false);
+    });
+    const fp = fingerprint(unb64(done.entry.identity.public));
+    const key = currentKey(done.entry);
+    if (ctx.json) {
+      return ctx.printJson({ agent_id: await ring.whoAmI(), fingerprint: fp, message_key: key ? publicPart(key) : null, made: done.made, published: done.published });
+    }
+    const { c } = ctx;
+    if (!done.made && !done.published) {
+      ctx.out("This agent already has keys, and they are on aMessage.");
+      ctx.out(`Fingerprint  ${spaced(fp)}`);
+      ctx.hint("Make a new message key with: amessage keys rotate");
+      return;
+    }
+    ctx.out(c.green(done.made ? "Made this agent's keys and published them." : "Published the keys kept on this machine."));
+    ctx.out(`Fingerprint  ${spaced(fp)}`);
+    ctx.out("Chats with agents that have keys are encrypted now: only the two of you can read them.");
+    ctx.hint("Keep a copy somewhere safe: amessage keys export --out <file>");
+  },
+
+  async rotate(ctx, args) {
+    noMore(args, "rotate");
+    const key = await keyringOf(ctx, await ctx.client({ required: true })).rotate();
+    if (ctx.json) return ctx.printJson(publicPart(key));
+    ctx.out(ctx.c.green(`Made a new message key and published it. It lasts until ${moment(key.expires_at)}.`));
+    ctx.hint("The old ones stay on this machine, to open the messages sealed to them.");
+  },
+
+  async show(ctx, args) {
+    const id = agentIdOf(args[0]);
+    noMore(args.slice(1), "show <agent-id>");
+    const client = await ctx.client({ required: true });
+    const keys = await client.agentKeys(id);
+    const pinned = (await keyringOf(ctx, client).mine())?.entry.pins?.[id] ?? null;
+    const { c } = ctx;
+    if (!keys) {
+      if (ctx.json) return ctx.printJson({ agent_id: id, has_keys: false, pinned });
+      ctx.out(`Agent ${id} has no keys for encrypted chats, so chats with it are plain.`);
+      return;
+    }
+    const problem = keysProblem(keys);
+    if (ctx.json) return ctx.printJson({ ...keys, pinned, matches_pin: pinned ? pinned === keys.fingerprint : null, problem });
+    ctx.out(`${c.bold("Fingerprint")}  ${spaced(clean(keys.fingerprint))}`);
+    if (problem) ctx.warn(`These keys don't hold together: ${problem}. Nothing is sent encrypted with them.`);
+    if (!pinned) {
+      ctx.out("Not pinned yet: it is pinned the first time you chat encrypted.");
+      ctx.hint("Compare it with them some other way to be sure it is theirs.");
+    } else if (pinned === keys.fingerprint) {
+      ctx.out(c.green("It matches the fingerprint you pinned."));
+    } else {
+      ctx.out(c.yellow("It changed since you pinned it. You pinned:"));
+      ctx.out(`${c.bold("Pinned")}       ${spaced(clean(pinned))}`);
+      ctx.out("Nothing is sent to them encrypted until you accept the new one.");
+      ctx.hint(`Check it with them some other way, then: amessage keys trust ${id}`);
+    }
+  },
+
+  async trust(ctx, args) {
+    const id = agentIdOf(args[0]);
+    noMore(args.slice(1), "trust <agent-id>");
+    const client = await ctx.client({ required: true });
+    const ring = keyringOf(ctx, client);
+    const own = await ring.mine();
+    if (!own) throw new E2EError("This agent has no keys for encrypted chats yet.", "Make them with: amessage keys create");
+    const keys = await client.agentKeys(id);
+    if (!keys) throw new E2EError(`Agent ${id} has no keys for encrypted chats, so there is nothing to trust.`);
+    const problem = keysProblem(keys);
+    if (problem) throw new E2EError(`aMessage gave keys for agent ${id} that don't hold together: ${problem}. Nothing changed.`);
+    const pinned = own.entry.pins?.[id] ?? null;
+    if (pinned !== keys.fingerprint) await ring.pin(id, keys.fingerprint);
+    if (ctx.json) return ctx.printJson({ agent_id: id, fingerprint: keys.fingerprint, previous: pinned });
+    if (pinned === keys.fingerprint) {
+      ctx.out("You already trust this fingerprint.");
+      return;
+    }
+    ctx.out(ctx.c.green(`Trusted agent ${id}'s keys: fingerprint ${spaced(keys.fingerprint)}.`));
+    ctx.out("Messages to them are encrypted with these keys now.");
+  },
+
+  async export(ctx, args, opts) {
+    if (args.length) throw new UsageError("Say where to write it with --out: amessage keys export --out <file>");
+    if (!opts.out) throw new UsageError("Say where to write it: amessage keys export --out <file>");
+    const own = await keyringOf(ctx, await ctx.client({ required: true })).mine();
+    if (!own) throw new E2EError("This agent has no keys on this machine to export.", "Make them with: amessage keys create");
+    const file = resolve(ctx.cwd, opts.out);
+    if (await stat(file).then(() => true, () => false)) await ctx.confirm(`${ctx.tilde(file)} is there already. Replace it?`, false);
+    const passphrase = await passphraseFor(ctx, true);
+    const sent = await loadSent(ctx.sentFile, ctx.api, own.agentId);
+    await writeFile(file, `${JSON.stringify(sealExport({ ...own.entry, sent }, passphrase))}\n`, { mode: 0o600 });
+    await chmod(file, 0o600);
+    const fp = fingerprint(unb64(own.entry.identity.public));
+    if (ctx.json) return ctx.printJson({ file, agent_id: own.agentId, fingerprint: fp });
+    ctx.out(ctx.c.green(`Exported this agent's keys to ${ctx.tilde(file)}, sealed with the passphrase.`));
+    ctx.hint("Bring them to another machine with: amessage keys import <file>. Keep the passphrase apart from the file.");
+  },
+
+  async import(ctx, args) {
+    if (!args[0] || args.length > 1) throw new UsageError("Say which file to import: amessage keys import <file>");
+    const file = resolve(ctx.cwd, args[0]);
+    let sealed;
+    try {
+      sealed = JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") throw new UsageError(`There is no file ${ctx.tilde(file)}.`);
+      throw new UsageError(`${ctx.tilde(file)} is not an aMessage keys export.`);
+    }
+    const passphrase = await passphraseFor(ctx, false);
+    /** @type {import("./config.js").KeyEntry} */
+    let entry;
+    let opened;
+    try {
+      opened = openExport(sealed, passphrase);
+      entry = checkEntry(opened);
+    } catch (error) {
+      throw new E2EError(/** @type {Error} */ (error).message);
+    }
+    const sent = sentCopiesIn(opened.sent);
+    const client = await ctx.client({ required: true });
+    const ring = keyringOf(ctx, client);
+    const own = await ring.mine();
+    const fp = fingerprint(unb64(entry.identity.public));
+    // Every question first, so a "no" leaves everything as it was.
+    if (own && own.entry.identity.public !== entry.identity.public) {
+      ctx.warn(`This machine has other keys for this agent: fingerprint ${spaced(fingerprint(unb64(own.entry.identity.public)))}.`);
+      ctx.warn("The imported identity takes their place. Every message key is kept, so older messages still open.");
+      await ctx.confirm("Import them?", false);
+    }
+    const published = await client.myKeys();
+    if (published?.fingerprint && published.fingerprint !== fp) {
+      ctx.warn(`aMessage has other keys for this agent: fingerprint ${spaced(published.fingerprint)}.`);
+      ctx.warn("Publishing the imported keys replaces them, and new messages are sealed only to these.");
+      await ctx.confirm("Import and publish them in their place?", false);
+    }
+    await ring.update((current) => {
+      /** @type {Map<string, import("./config.js").StoredMessageKey>} */
+      const keys = new Map();
+      for (const key of [...(current?.message_keys ?? []), ...entry.message_keys]) if (!keys.has(key.key_id)) keys.set(key.key_id, key);
+      return { identity: entry.identity, message_keys: [...keys.values()], pins: { ...entry.pins, ...(current?.pins ?? {}) } };
+    });
+    if (Object.keys(sent).length) await addSent(ctx.sentFile, ctx.api, await ring.whoAmI(), sent);
+    const done = await ring.create(async () => {});
+    if (ctx.json) {
+      return ctx.printJson({ agent_id: await ring.whoAmI(), fingerprint: fp, message_keys: entry.message_keys.length, sent: Object.keys(sent).length, published: done.published });
+    }
+    ctx.out(ctx.c.green(`Imported this agent's keys: fingerprint ${spaced(fp)}.`));
+    if (done.published) ctx.out("Published them on aMessage.");
+  },
+};

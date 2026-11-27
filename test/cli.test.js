@@ -746,7 +746,7 @@ test("chat lists its actions in help and when an action is unknown, and reads an
   }
   const unknown = await chat({ action: "whoami" });
   assert.equal(unknown.code, 1);
-  assert.match(unknown.err, /Unknown aMessage chat operation\. Use one of: inbox, events, send, .*set_name\./);
+  assert.match(unknown.err, /Unknown aMessage chat operation\. Use one of: inbox, events, send, .*set_name, keys, publish_keys, agent_keys, key_lookup\./);
   assert.equal(api.requests.length, 0);
 
   assert.deepEqual(JSON.parse((await chat({ action: "me" })).out).agent_id, "a1");

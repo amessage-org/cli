@@ -108,3 +108,110 @@ export async function run(argv, options = {}) {
   });
   return { code, out, err, home };
 }
+
+/**
+ * The same routes as fakeApi, served over HTTP on a local port, for a CLI run in its own process.
+ * @param {Parameters<typeof fakeApi>[0]} routes
+ */
+export async function httpApi(routes) {
+  const { createServer } = await import("node:http");
+  /** @type {{ method: string, url: URL, headers: Record<string, string>, body: any }[]} */
+  const requests = [];
+  const server = createServer(async (req, res) => {
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const headers = /** @type {Record<string, string>} */ (Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)])));
+    const body = text && headers["content-type"] === "application/json" ? JSON.parse(text) : text || undefined;
+    requests.push({ method: req.method ?? "GET", url, headers, body });
+    const route = routes[`${req.method} ${url.pathname}`];
+    const [status, payload, extra] = route ? route({ body, headers, url }) : [404, { title: "Not Found", status: 404, detail: "No route" }];
+    res.writeHead(status, { "content-type": "application/json", ...extra });
+    res.end(status === 204 ? undefined : typeof payload === "string" ? payload : JSON.stringify(payload));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(null)));
+  const address = /** @type {import("node:net").AddressInfo} */ (server.address());
+  return { url: `http://127.0.0.1:${address.port}`, requests, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
+export const ALICE = "a11ce000-0000-4000-8000-000000000001";
+export const BOB = "b0b00000-0000-4000-8000-000000000002";
+export const CHAT = CONVERSATION_ID;
+export const NO_KEYS = /** @type {[number, unknown]} */ ([404, { status: 404, code: "not_found", detail: "This agent has no keys." }]);
+
+/**
+ * Two agents with encrypted chats: Alice is the CLI under test, Bob lives in the test with keys
+ * made here. The fake API keeps Alice's published keys and every message posted.
+ */
+export async function twoAgents() {
+  const e2e = await import("../src/e2e.js");
+  const bob = () => {
+    const identity = e2e.generateIdentity();
+    const messageKey = e2e.newMessageKey(identity.privateKey);
+    return {
+      identity,
+      messageKey,
+      published: {
+        agent_id: BOB,
+        identity_key: e2e.b64(identity.publicKey),
+        fingerprint: e2e.fingerprint(identity.publicKey),
+        message_key: messageKey.public,
+      },
+    };
+  };
+  const state = {
+    /** @type {any} */ alice: null,
+    bob: bob(),
+    /** @type {any[]} */ posted: [],
+    /** @type {any[]} */ chat: [],
+    newBob() {
+      state.bob = bob();
+    },
+    /** Bob seals `text` to Alice's published message key. @param {string} text */
+    fromBob(text) {
+      return e2e.sealMessage({
+        text,
+        from: BOB,
+        to: ALICE,
+        identityPrivate: state.bob.identity.privateKey,
+        identityPublic: state.bob.identity.publicKey,
+        recipientKey: state.alice.message_key,
+      });
+    },
+    /** Bob opens what Alice sealed to him. @param {any} envelope */
+    bobOpens(envelope) {
+      return e2e.openMessage({
+        envelope,
+        messagePrivate: state.bob.messageKey.privateKey,
+        senderIdentityPublic: e2e.unb64(state.alice.identity_key),
+        me: BOB,
+        sender: ALICE,
+      });
+    },
+  };
+  let sent = 0;
+  /** @type {Parameters<typeof fakeApi>[0]} */
+  const routes = {
+    "POST /v1/agents": () => [201, { agent: { agent_id: ALICE }, token: "agt_alice" }],
+    "GET /v1/me": () => [200, { agent_id: ALICE, name: null, linked_to_account: false }],
+    "GET /v1/me/keys": () => (state.alice ? [200, state.alice] : NO_KEYS),
+    "PUT /v1/me/keys": ({ body }) => {
+      state.alice = { agent_id: ALICE, identity_key: body.identity_key, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), message_key: body.message_key };
+      return [200, state.alice];
+    },
+    [`GET /v1/agents/${BOB}/keys`]: () => (state.bob ? [200, state.bob.published] : NO_KEYS),
+    "POST /v1/key-lookups": ({ body }) => (body.to.email === "bob@example.com" && state.bob ? [200, state.bob.published] : NO_KEYS),
+    "POST /v1/messages": ({ body }) => {
+      state.posted.push(body);
+      const id = `5e4d0000-0000-4000-8000-${String(++sent).padStart(12, "0")}`;
+      return [201, { id, state: "posted", conversation_id: CHAT, sender_agent_id: ALICE, text: body.text ?? null, encrypted: body.encrypted ?? null }];
+    },
+    [`GET /v1/conversations/${CHAT}`]: () => [
+      200,
+      { id: CHAT, encrypted: true, counterpart: { agent_id: BOB, display_name: "Bob", verified: [], encryption: state.bob ? { fingerprint: state.bob.published.fingerprint } : null } },
+    ],
+    [`GET /v1/conversations/${CHAT}/messages`]: () => [200, { data: state.chat, next_cursor: null }],
+    [`PUT /v1/conversations/${CHAT}/read-position`]: ({ body }) => [200, body],
+  };
+  return { state, routes };
+}

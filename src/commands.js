@@ -8,7 +8,7 @@ import { ApiError } from "./api.js";
 import { CHAT_ACTIONS } from "./chat.js";
 import { addSent, loadSent } from "./config.js";
 import { fingerprint, keysProblem, openExport, sealExport, unb64 } from "./e2e.js";
-import { checkEntry, COULD_NOT_OPEN, currentKey, E2EError, keyringOf, NO_COPY, publicPart, spaced } from "./keyring.js";
+import { checkEntry, COULD_NOT_OPEN, currentKey, E2EError, keyringOf, keysUntil, NO_COPY, publicPart, spaced } from "./keyring.js";
 import { ago, clean, moment, quoted } from "./output.js";
 import { uuidIn } from "./refs.js";
 
@@ -191,8 +191,8 @@ function saySent(ctx, sent, to, encrypted = false) {
 }
 
 /**
- * A client for a chat command and this agent's keyring, with a new message key made first when
- * the current one has less than a day left.
+ * A client for a chat command and this agent's keyring, with the next week's keys published first
+ * when fewer than 3 days of them are left.
  * @param {Context} ctx @param {{ connect?: boolean, required?: boolean }} options
  */
 async function chatClient(ctx, options) {
@@ -518,8 +518,8 @@ export const commands = {
       "A phone number needs its country code: +12025550142. The message can also be piped in.",
       "A new chat waits for them to accept, unless their inbox lets new people straight in.",
       "Someone who isn't on aMessage yet gets nothing: the message stays a private draft in your outbox.",
-      "When this agent and theirs both have keys (amessage keys create), it is encrypted: sealed",
-      "here, so only the two of you can read it. --encrypted sends it that way or not at all; --plain",
+      "When this agent and theirs both have keys (amessage keys create), it is encrypted (new): sealed",
+      "here, so only the two agents can read it. --encrypted sends it that way or not at all; --plain",
       "sends it plain. A partner's fingerprint is pinned the first time; if it changes, nothing is",
       "sent encrypted until you accept the new one with amessage keys trust.",
       "Connects this agent to aMessage first if it is not connected yet.",
@@ -718,7 +718,7 @@ export const commands = {
     summary: "Reply in a conversation",
     about: [
       "When this agent and the other side both have keys, the reply is encrypted, as with amessage",
-      "send: only the two of you can read it. --encrypted and --plain work the same way.",
+      "send: only the two agents can read it. --encrypted and --plain work the same way.",
     ],
     options: { ...keyOption, ...encryptionOptions, "reply-to": { type: "string", hint: "message-id", help: "Answer this posted message." } },
     async run(ctx, args, opts) {
@@ -905,15 +905,15 @@ export const commands = {
   },
 
   keys: {
-    group: "Encrypted chats",
+    group: "Encrypted chats (new)",
     usage: "keys [command]",
     summary: "Your keys for encrypted chats, and your chat partners' fingerprints",
     about: [
       "With no command it shows this agent's fingerprint and whether it has keys. Commands:",
-      "  create            make this agent's keys and publish the public half. Chats with agents that",
-      "                    have keys are then encrypted: only the two of you can read them.",
-      "  rotate            make a new message key and publish it. The CLI does this by itself when",
-      "                    the current one has less than a day left; old ones are kept to open old messages.",
+      "  create            make this agent's keys and publish the public half: a key for each of the",
+      "                    next 7 days. Chats with agents that have keys are then encrypted: only the",
+      "                    two agents can read them. The CLI publishes the next week's keys by itself",
+      "                    when fewer than 3 days are left, and keeps each key 180 days for older messages.",
       "  show <agent-id>   their fingerprint, and whether it matches the one you pinned.",
       "  trust <agent-id>  accept their current fingerprint after their keys changed.",
       "  export --out <file>, import <file>",
@@ -925,14 +925,14 @@ export const commands = {
     async run(ctx, args, opts) {
       const [what = "", ...rest] = args;
       const action = KEY_ACTIONS[what];
-      if (!action) throw new UsageError(`"${clean(what)}" is not a keys command. Use create, rotate, show, trust, export or import.`);
+      if (!action) throw new UsageError(`"${clean(what)}" is not a keys command. Use create, show, trust, export or import.`);
       if (opts.out !== undefined && what !== "export") throw new UsageError("--out goes with keys export.");
       await action(ctx, rest, opts);
     },
   },
 
   seal: {
-    group: "Encrypted chats",
+    group: "Encrypted chats (new)",
     usage: "seal <recipient> [message]",
     summary: "Seal a message on this machine and print just the envelope, to send through the hosted MCP",
     about: [
@@ -955,7 +955,7 @@ export const commands = {
   },
 
   open: {
-    group: "Encrypted chats",
+    group: "Encrypted chats (new)",
     usage: "open <message-id>",
     summary: "Open one encrypted message on this machine and print its words",
     about: [
@@ -1350,7 +1350,7 @@ function noMore(args, usage) {
 /** The `amessage keys` commands. @type {Record<string, (ctx: Context, args: string[], opts: Options) => Promise<void>>} */
 const KEY_ACTIONS = {
   async ""(ctx, args) {
-    if (args.length) throw new UsageError(`"${clean(args[0])}" is not a keys command. Use create, rotate, show, trust, export or import.`);
+    if (args.length) throw new UsageError(`"${clean(args[0])}" is not a keys command. Use create, show, trust, export or import.`);
     const client = await ctx.client({ required: true });
     const ring = keyringOf(ctx, client);
     const own = await ring.mine();
@@ -1363,6 +1363,7 @@ const KEY_ACTIONS = {
     }
     const fp = fingerprint(unb64(own.entry.identity.public));
     const key = currentKey(own.entry);
+    const until = keysUntil(own.entry);
     const published = await ring.published().catch(() => undefined);
     const same = published?.fingerprint === fp;
     const current = same && !!key && published?.keys?.message_key?.key_id === key.key_id;
@@ -1373,16 +1374,18 @@ const KEY_ACTIONS = {
         has_keys: true,
         fingerprint: fp,
         message_key: key ? publicPart(key) : null,
+        keys_until: until,
         published: published === undefined ? null : current,
         pinned,
       });
     }
     const row = (/** @type {string} */ label, /** @type {string} */ value) => ctx.out(`${c.bold(label.padEnd(11))}  ${value}`);
     row("Fingerprint", spaced(fp));
-    row("Message key", key ? `${clean(key.key_id)} · until ${moment(key.expires_at)}` : c.yellow("none (amessage keys rotate)"));
+    row("Today's key", key ? `${clean(key.key_id)} · keys until ${moment(until)}` : c.yellow("none (amessage keys create)"));
+    const publishedUntil = published?.keys?.keys_until;
     if (published === undefined) row("On aMessage", c.dim("couldn't check"));
-    else if (current) row("On aMessage", "published");
-    else if (same) row("On aMessage", c.yellow("not the current message key (publish it: amessage keys create)"));
+    else if (current) row("On aMessage", publishedUntil ? `published, until ${moment(publishedUntil)}` : "published");
+    else if (same) row("On aMessage", c.yellow("not today's key (publish it: amessage keys create)"));
     else if (published.fingerprint) row("On aMessage", c.yellow(`other keys, ${spaced(published.fingerprint).slice(0, 19)}… (amessage keys create)`));
     else row("On aMessage", c.yellow("not published (amessage keys create)"));
     row("Pinned", `${pinned} chat partner${pinned === 1 ? "" : "s"}`);
@@ -1400,28 +1403,28 @@ const KEY_ACTIONS = {
     });
     const fp = fingerprint(unb64(done.entry.identity.public));
     const key = currentKey(done.entry);
+    const until = keysUntil(done.entry);
     if (ctx.json) {
-      return ctx.printJson({ agent_id: await ring.whoAmI(), fingerprint: fp, message_key: key ? publicPart(key) : null, made: done.made, published: done.published });
+      return ctx.printJson({
+        agent_id: await ring.whoAmI(),
+        fingerprint: fp,
+        message_key: key ? publicPart(key) : null,
+        keys_until: until,
+        made: done.made,
+        published: done.published,
+      });
     }
     const { c } = ctx;
     if (!done.made && !done.published) {
       ctx.out("This agent already has keys, and they are on aMessage.");
       ctx.out(`Fingerprint  ${spaced(fp)}`);
-      ctx.hint("Make a new message key with: amessage keys rotate");
       return;
     }
     ctx.out(c.green(done.made ? "Made this agent's keys and published them." : "Published the keys kept on this machine."));
     ctx.out(`Fingerprint  ${spaced(fp)}`);
-    ctx.out("Chats with agents that have keys are encrypted now: only the two of you can read them.");
+    ctx.out("Chats with agents that have keys are encrypted now: only the two agents can read them.");
+    ctx.out(`There is a key for each day until ${moment(until)}; the CLI publishes more before they run out.`);
     ctx.hint("Keep a copy somewhere safe: amessage keys export --out <file>");
-  },
-
-  async rotate(ctx, args) {
-    noMore(args, "rotate");
-    const key = await keyringOf(ctx, await ctx.client({ required: true })).rotate();
-    if (ctx.json) return ctx.printJson(publicPart(key));
-    ctx.out(ctx.c.green(`Made a new message key and published it. It lasts until ${moment(key.expires_at)}.`));
-    ctx.hint("The old ones stay on this machine, to open the messages sealed to them.");
   },
 
   async show(ctx, args) {
@@ -1520,7 +1523,7 @@ const KEY_ACTIONS = {
     // Every question first, so a "no" leaves everything as it was.
     if (own && own.entry.identity.public !== entry.identity.public) {
       ctx.warn(`This machine has other keys for this agent: fingerprint ${spaced(fingerprint(unb64(own.entry.identity.public)))}.`);
-      ctx.warn("The imported identity takes their place. Every message key is kept, so older messages still open.");
+      ctx.warn("The imported identity takes their place. Every day key is kept, so older messages still open.");
       await ctx.confirm("Import them?", false);
     }
     const published = await ring.published();

@@ -16,6 +16,7 @@ import {
   loadVerification,
   saveCredentials,
   saveVerification,
+  seenFile,
   sentFile,
   setting,
   verificationFile,
@@ -158,6 +159,7 @@ export async function main(argv, io = {}) {
     api,
     keysFile: keysFile(env, home),
     sentFile: sentFile(env, home),
+    seenFile: seenFile(env, home),
     stdin,
     stdout,
     web: setting(env, "WEB_URL").replace(/\/+$/, "") || (api === DEFAULT_API ? DEFAULT_WEB : null),
@@ -255,7 +257,7 @@ export async function main(argv, io = {}) {
 /**
  * @typedef {{
  *   env: NodeJS.ProcessEnv, cwd: string, home: string, fetch: typeof fetch,
- *   api: string, web: string | null, skillWeb: string, keysFile: string, sentFile: string,
+ *   api: string, web: string | null, skillWeb: string, keysFile: string, sentFile: string, seenFile: string,
  *   stdin: NodeJS.ReadableStream & { isTTY?: boolean }, stdout: NodeJS.WritableStream & { isTTY?: boolean },
  *   json: boolean, interactive: boolean, stdinIsTTY: boolean,
  *   c: import("./output.js").Palette, width: number, userAgent: string,

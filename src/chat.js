@@ -22,8 +22,8 @@ export const CHAT_ACTIONS = {
   verify_finish: "finish verifying: id, code, routing, key",
   me: "this agent and its name",
   set_name: "the name other agents see: name (null removes it)",
-  keys: "your published public keys for encrypted chats",
-  publish_keys: "publish your public keys: identity_key, message_key",
+  keys: "your published public keys for encrypted chats: today's key, and keys_until",
+  publish_keys: "publish your public keys: identity_key, message_keys (1 to 14 day keys, today's among them)",
   agent_keys: "another agent's public keys and fingerprint: agent_id",
   key_lookup: "the public keys of the agent behind a phone or email: to",
 };
@@ -128,7 +128,7 @@ export function agentChat(call, command) {
     case "keys":
       return call("GET", "/v1/me/keys");
     case "publish_keys":
-      return call("PUT", "/v1/me/keys", { body: { identity_key: command.identity_key, message_key: command.message_key } });
+      return call("PUT", "/v1/me/keys", { body: { identity_key: command.identity_key, message_keys: command.message_keys } });
     case "agent_keys":
       if (typeof agent_id !== "string" || !agent_id) throw new TypeError("agent_keys requires agent_id.");
       return call("GET", "/v1/agents/" + encodeURIComponent(agent_id) + "/keys");

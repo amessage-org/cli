@@ -140,51 +140,70 @@ export const CHAT = CONVERSATION_ID;
 export const NO_KEYS = /** @type {[number, unknown]} */ ([404, { status: 404, code: "not_found", detail: "This agent has no keys." }]);
 
 /**
- * Two agents with encrypted chats: Alice is the CLI under test, Bob lives in the test with keys
- * made here. The fake API keeps Alice's published keys and every message posted.
+ * Two agents with encrypted chats: Alice is the CLI under test, Bob lives in the test with day
+ * keys made here. The fake API keeps Alice's identity and every day key she published, answers
+ * with today's, and keeps every message posted.
  */
 export async function twoAgents() {
   const e2e = await import("../src/e2e.js");
   const bob = () => {
     const identity = e2e.generateIdentity();
-    const messageKey = e2e.newMessageKey(identity.privateKey);
+    const days = e2e.newMessageKeys(identity.privateKey);
     return {
       identity,
-      messageKey,
+      days,
+      /** Today's key, the one others seal to. */
+      messageKey: days[0],
       published: {
         agent_id: BOB,
         identity_key: e2e.b64(identity.publicKey),
         fingerprint: e2e.fingerprint(identity.publicKey),
-        message_key: messageKey.public,
+        message_key: days[0].public,
       },
     };
   };
+  /** Today's key of a list, as aMessage picks it. @param {any[]} keys */
+  const today = (keys) => keys.find((k) => Date.parse(k.valid_from) <= Date.now() && Date.now() < Date.parse(k.expires_at)) ?? null;
   const state = {
-    /** @type {any} */ alice: null,
-    /** A fingerprint aMessage has for Alice from another machine, whose message key lapsed. @type {string | null} */ elsewhere: null,
+    /** Alice's identity key as aMessage has it, and every day key she published. @type {string | null} */ aliceIdentity: null,
+    /** @type {any[]} */ aliceDays: [],
+    /** Alice's keys as GET /v1/me/keys answers them, or null. */
+    get alice() {
+      const key = state.aliceIdentity ? today(state.aliceDays) : null;
+      if (!state.aliceIdentity || !key) return null;
+      return {
+        agent_id: ALICE,
+        identity_key: state.aliceIdentity,
+        fingerprint: e2e.fingerprint(e2e.unb64(state.aliceIdentity)),
+        message_key: key,
+        keys_until: state.aliceDays.map((k) => k.expires_at).sort().at(-1),
+      };
+    },
+    /** A fingerprint aMessage has for Alice from another machine, whose day keys ran out. @type {string | null} */ elsewhere: null,
     bob: bob(),
     /** @type {any[]} */ posted: [],
     /** @type {any[]} */ chat: [],
     newBob() {
       state.bob = bob();
     },
-    /** Bob seals `text` to Alice's published message key. @param {string} text */
-    fromBob(text) {
+    /** Bob seals `text` to Alice's key for today, or to `key`. @param {string} text @param {{ key_id: string, public_key: string }} [key] */
+    fromBob(text, key) {
       return e2e.sealMessage({
         text,
         from: BOB,
         to: ALICE,
         identityPrivate: state.bob.identity.privateKey,
         identityPublic: state.bob.identity.publicKey,
-        recipientKey: state.alice.message_key,
+        recipientKey: key ?? /** @type {any} */ (state.alice).message_key,
       });
     },
     /** Bob opens what Alice sealed to him. @param {any} envelope */
     bobOpens(envelope) {
+      const day = state.bob.days.find((d) => d.public.key_id === envelope.recipient_key) ?? state.bob.messageKey;
       return e2e.openMessage({
         envelope,
-        messagePrivate: state.bob.messageKey.privateKey,
-        senderIdentityPublic: e2e.unb64(state.alice.identity_key),
+        messagePrivate: day.privateKey,
+        senderIdentityPublic: e2e.unb64(/** @type {any} */ (state.alice).identity_key),
         me: BOB,
         sender: ALICE,
       });
@@ -197,12 +216,31 @@ export async function twoAgents() {
     // The identity aMessage has for Alice: hers, or one made on another machine.
     "GET /v1/me": () => [
       200,
-      { agent_id: ALICE, name: null, linked_to_account: false, encryption: state.elsewhere ? { fingerprint: state.elsewhere } : state.alice ? { fingerprint: state.alice.fingerprint } : null },
+      {
+        agent_id: ALICE,
+        name: null,
+        linked_to_account: false,
+        encryption: state.elsewhere ? { fingerprint: state.elsewhere } : state.aliceIdentity ? { fingerprint: e2e.fingerprint(e2e.unb64(state.aliceIdentity)) } : null,
+      },
     ],
     "GET /v1/me/keys": () => (state.alice ? [200, state.alice] : NO_KEYS),
+    // Checks what the server checks: 1 to 14 day keys, each signed by the identity, today's among them.
     "PUT /v1/me/keys": ({ body }) => {
-      state.alice = { agent_id: ALICE, identity_key: body.identity_key, fingerprint: e2e.fingerprint(e2e.unb64(body.identity_key)), message_key: body.message_key };
-      return [200, state.alice];
+      const refuse = (/** @type {string} */ detail) => /** @type {[number, unknown]} */ ([400, { status: 400, code: "bad_request", detail }]);
+      if (!e2e.isBytes(body?.identity_key, 32)) return refuse("identity_key");
+      const keys = body.message_keys;
+      if (!Array.isArray(keys) || keys.length < 1 || keys.length > 14) return refuse("message_keys is a list of 1 to 14 day keys.");
+      const identity = e2e.unb64(body.identity_key);
+      for (const key of keys) {
+        const problem = e2e.dayKeyProblem(identity, key);
+        if (problem || Date.parse(key.expires_at) <= Date.now()) return refuse(problem ?? "ended");
+      }
+      if (!today(keys) && !today(body.identity_key === state.aliceIdentity ? state.aliceDays : [])) return refuse("Include today’s key.");
+      if (body.identity_key !== state.aliceIdentity) state.aliceDays = [];
+      state.aliceIdentity = body.identity_key;
+      for (const key of keys) if (!state.aliceDays.some((k) => k.key_id === key.key_id)) state.aliceDays.push(key);
+      const { keys_until: _until, ...published } = /** @type {any} */ (state.alice);
+      return [200, published];
     },
     [`GET /v1/agents/${BOB}/keys`]: () => (state.bob ? [200, state.bob.published] : NO_KEYS),
     "POST /v1/key-lookups": ({ body }) => (body.to.email === "bob@example.com" && state.bob ? [200, state.bob.published] : NO_KEYS),

@@ -39,6 +39,7 @@ export class NotConnected extends Error {
  * @typedef {{ new_contacts: "requests" | "open" | "closed", allow_from: "anyone" | "phone_or_email" | "phone" | "email" }} Preferences
  * @typedef {{ agent_id: string } | { phone: string } | { email: string } | { conversation_id: string } | { beacon_id: string }} Recipient
  * @typedef {{ agent_id: string, identity_key: string, fingerprint: string, message_key: import("./e2e.js").MessageKey }} AgentKeys
+ * @typedef {AgentKeys & { keys_until: string }} MyKeys This agent's keys, with today's key and the end of the last day it published.
  */
 
 /** An answer, or null when the API says there is none (404). @param {Promise<any>} answer */
@@ -159,9 +160,9 @@ export function createClient({ base, token = null, userAgent, fetch: send = glob
     send: (to, body, { replyTo, key } = {}) => chat({ action: "send", to, ...body, reply_to_message_id: replyTo, key }),
     /** One message, by its id. @param {string} message */
     message: (message) => chat({ action: "read", id: message }),
-    /** This agent's published keys, or null when it has none. */
+    /** This agent's published keys, with today's key and keys_until, or null when it has no key for today. @returns {Promise<MyKeys | null>} */
     myKeys: () => orNull(chat({ action: "keys" })),
-    /** @param {{ identity_key: string, message_key: import("./e2e.js").MessageKey }} keys */
+    /** Publish the identity key and day keys it signed, 1 to 14, today's among them. @param {{ identity_key: string, message_keys: import("./e2e.js").MessageKey[] }} keys @returns {Promise<AgentKeys>} */
     publishKeys: (keys) => chat({ action: "publish_keys", ...keys }),
     /** Another agent's public keys, or null when it has none. @param {string} agent */
     agentKeys: (agent) => orNull(chat({ action: "agent_keys", agent_id: agent })),

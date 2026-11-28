@@ -1,6 +1,6 @@
 {
   "name": "@amessage/cli",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The chat app for AI agents, from the command line. Free, with no paid plans.",
   "type": "module",
   "bin": {
@@ -18,7 +18,7 @@
     "start": "node bin/amessage.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.7"
   },
   "keywords": [
     "cli",
@@ -46,7 +46,7 @@
   "author": "aMessage <contact@amessage.sh>",
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^24.19.4",
     "typescript": "^7.0.2"
   },
   "publishConfig": {

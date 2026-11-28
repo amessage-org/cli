@@ -55,12 +55,14 @@ function rpc(child) {
 test("amessage mcp serves agent_chat over stdio: sealed sends, opened reads, and never a private key", async () => {
   const world = await twoAgents();
   const api = await httpApi(world.routes);
+  let stop = () => {};
   try {
     const env = { AMESSAGE_API_URL: api.url };
     const made = await run(["keys", "create"], { fetch: (input, init) => fetch(input, init), env });
     assert.equal(made.code, 0, made.err);
     const entry = JSON.parse(await readFile(join(made.home, ".config/amessage/keys.json"), "utf8"))[api.url][ALICE];
-    const secrets = [entry.identity.private, entry.message_keys[0].private];
+    const secrets = [entry.identity.private, ...entry.message_keys.map((/** @type {any} */ k) => k.private)];
+    assert.equal(entry.message_keys.length, 7);
 
     const child = spawn(process.execPath, [BIN, "mcp"], {
       env: { PATH: process.env.PATH ?? "", HOME: made.home, AMESSAGE_API_URL: api.url, AMESSAGE_CONFIG_DIR: join(made.home, ".config/amessage") },
@@ -69,15 +71,21 @@ test("amessage mcp serves agent_chat over stdio: sealed sends, opened reads, and
     let stderr = "";
     child.stderr.on("data", (chunk) => (stderr += chunk));
     const exited = new Promise((resolve) => child.on("exit", resolve));
+    // A failed assertion still ends the server, so the test run doesn't hang on it.
+    stop = () => child.kill();
     const mcp = rpc(child);
 
     const init = await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } });
     assert.equal(init.result.serverInfo.name, "amessage", JSON.stringify(init));
     assert.match(init.result.instructions, /encrypted: only the two agents can read them/);
+    assert.match(init.result.instructions, /Encrypted chats are new/);
+    assert.doesNotMatch(`${init.result.instructions}`, /end-to-end|quantum/i);
     mcp.notify("notifications/initialized");
     const tools = (await mcp.request("tools/list", {})).result.tools;
     assert.deepEqual(tools.map((/** @type {any} */ t) => t.name), ["agent_chat"]);
     assert.match(tools[0].description, /keys: this agent's fingerprint/);
+    assert.match(tools[0].description, /publish_keys: .*a key for each of the next 7 days/);
+    assert.doesNotMatch(tools[0].description, /end-to-end|quantum/i);
 
     /** @param {Record<string, unknown>} command */
     const call = async (command) => {
@@ -89,11 +97,13 @@ test("amessage mcp serves agent_chat over stdio: sealed sends, opened reads, and
 
     const keys = await call({ action: "keys" });
     assert.equal(keys.error, false, keys.text);
+    const today = world.state.alice.message_key;
     assert.deepEqual(JSON.parse(keys.text), {
       agent_id: ALICE,
       has_keys: true,
       fingerprint: world.state.alice.fingerprint,
-      message_key: { key_id: world.state.alice.message_key.key_id, expires_at: world.state.alice.message_key.expires_at },
+      message_key: { key_id: today.key_id, valid_from: today.valid_from, expires_at: today.expires_at },
+      keys_until: world.state.alice.keys_until,
       published: true,
       pinned: 0,
     });
@@ -162,6 +172,7 @@ test("amessage mcp serves agent_chat over stdio: sealed sends, opened reads, and
     child.stdin.end();
     assert.equal(await exited, 0, stderr);
   } finally {
+    stop();
     await api.close();
   }
 });

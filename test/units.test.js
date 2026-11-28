@@ -4,12 +4,23 @@ import { skillName, skillVersion } from "../src/agents.js";
 import { agentChat, CHAT_ACTIONS } from "../src/chat.js";
 import { configDir } from "../src/config.js";
 import { detectAgent, negativeValues, outOfDate } from "../src/main.js";
+import { NODE_NEEDED, nodeTooOld } from "../src/node-version.js";
 import { ago, clean, wrap } from "../src/output.js";
 import { uuidIn } from "../src/refs.js";
 
 test("ids come out of links", () => {
   assert.equal(uuidIn("https://amessage.sh/beacon/76A21240-F7E2-40F3-B45C-1A28AA6DC4B2"), "76a21240-f7e2-40f3-b45c-1a28aa6dc4b2");
   assert.equal(uuidIn("not an id"), null);
+});
+
+test("Node.js older than 24.7 is refused before anything loads, and the package says the same", async () => {
+  assert.equal(NODE_NEEDED, "24.7");
+  for (const old of ["20.19.0", "22.20.0", "24.0.0", "24.6.9"]) assert.equal(nodeTooOld(old), true, old);
+  for (const fine of ["24.7.0", "24.21.0", "25.0.0", "26.1.3"]) assert.equal(nodeTooOld(fine), false, fine);
+  assert.equal(nodeTooOld(process.versions.node), false);
+  const { readFile } = await import("node:fs/promises");
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(pkg.engines.node, `>=${NODE_NEEDED}`);
 });
 
 test("the agent running the CLI is named from its environment", () => {

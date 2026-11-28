@@ -102,8 +102,9 @@ export const forgetVerification = (file, api) => forgetEntry(file, api);
 // private keys that never leave this machine. Owner-only, like the token.
 
 /**
- * @typedef {{ key_id: string, private: string, public_key: string, expires_at: string, signature: string }} StoredMessageKey
+ * @typedef {{ key_id: string, private: string, public_key: string, valid_from: string, expires_at: string, signature: string }} StoredMessageKey
  * @typedef {{ text: string, sent_at: string }} SentCopy
+ * @typedef {{ message_id: string, opened_at: string }} SeenCommitment
  * @typedef {{ identity: { private: string, public: string }, message_keys: StoredMessageKey[], pins: Record<string, string> }} KeyEntry
  */
 
@@ -117,9 +118,46 @@ export function sentFile(env, home) {
   return join(configDir(env, home), "sent.json");
 }
 
-/** Every agent's keys for this API, by agent id. @param {string} file @param {string} api @returns {Promise<Record<string, KeyEntry>>} */
+/** The commitments of the encrypted messages opened here, to drop replays. @param {NodeJS.ProcessEnv} env @param {string} home */
+export function seenFile(env, home) {
+  return join(configDir(env, home), "seen.json");
+}
+
+/**
+ * Drops version 1 message keys (those without valid_from) from every entry, keeping each identity,
+ * its pins and its day keys. Whether anything was dropped.
+ * @param {Record<string, any>} all
+ */
+function dropVersion1Keys(all) {
+  let dropped = false;
+  for (const ring of Object.values(all)) {
+    if (!ring || typeof ring !== "object") continue;
+    for (const entry of Object.values(ring)) {
+      if (!entry || typeof entry !== "object" || !Array.isArray(entry.message_keys)) continue;
+      const kept = entry.message_keys.filter((/** @type {any} */ key) => typeof key?.valid_from === "string");
+      if (kept.length === entry.message_keys.length) continue;
+      entry.message_keys = kept;
+      dropped = true;
+    }
+  }
+  return dropped;
+}
+
+/** keys.json as it is on disk, without version 1 message keys. @param {string} file */
+async function readKeys(file) {
+  const all = await readAll(file);
+  return { all, dropped: dropVersion1Keys(all) };
+}
+
+/**
+ * Every agent's keys for this API, by agent id. The first read after an update from version 1
+ * drops its message keys from keys.json: nothing reads them any more.
+ * @param {string} file @param {string} api @returns {Promise<Record<string, KeyEntry>>}
+ */
 export async function loadKeyring(file, api) {
-  const entry = (await readAll(file))[api];
+  const { all, dropped } = await readKeys(file);
+  if (dropped) await writeAll(file, all);
+  const entry = all[api];
   return entry && typeof entry === "object" ? entry : {};
 }
 
@@ -130,7 +168,7 @@ export async function loadKeyring(file, api) {
  * @param {(entry: KeyEntry | null) => KeyEntry} change
  */
 export async function updateKeyEntry(file, api, agentId, change) {
-  const all = await readAll(file);
+  const { all } = await readKeys(file);
   const ring = all[api] && typeof all[api] === "object" ? all[api] : {};
   const entry = change(ring[agentId] ?? null);
   all[api] = { ...ring, [agentId]: entry };
@@ -144,8 +182,8 @@ export async function loadSent(file, api, agentId) {
   return entry && typeof entry === "object" ? entry : {};
 }
 
-/** Copies are kept as long as aMessage keeps the messages: 180 days. */
-const KEEP_SENT_MS = 180 * 86_400_000;
+/** Copies and seen commitments are kept as long as aMessage keeps the messages: 180 days. */
+const KEEP_MS = 180 * 86_400_000;
 
 /**
  * Keep copies of messages sent encrypted, by message id, and drop those older than 180 days.
@@ -158,7 +196,30 @@ export async function addSent(file, api, agentId, copies, now = new Date()) {
   const kept = {};
   for (const [id, copy] of Object.entries({ ...(all[api][agentId] ?? {}), ...copies })) {
     const at = new Date(copy?.sent_at).getTime();
-    if (typeof copy?.text === "string" && Number.isFinite(at) && now.getTime() - at < KEEP_SENT_MS) kept[id] = copy;
+    if (typeof copy?.text === "string" && Number.isFinite(at) && now.getTime() - at < KEEP_MS) kept[id] = copy;
+  }
+  all[api][agentId] = kept;
+  await writeAll(file, all);
+}
+
+/** The commitments opened here, each with the message it came in. @param {string} file @param {string} api @param {string} agentId @returns {Promise<Record<string, SeenCommitment>>} */
+export async function loadSeen(file, api, agentId) {
+  const entry = (await readAll(file))[api]?.[agentId];
+  return entry && typeof entry === "object" ? entry : {};
+}
+
+/**
+ * Keep the commitments of messages just opened, and drop those opened more than 180 days ago.
+ * @param {string} file @param {string} api @param {string} agentId @param {Record<string, SeenCommitment>} seen @param {Date} [now]
+ */
+export async function addSeen(file, api, agentId, seen, now = new Date()) {
+  const all = await readAll(file);
+  all[api] ??= {};
+  /** @type {Record<string, SeenCommitment>} */
+  const kept = {};
+  for (const [commitment, mark] of Object.entries({ ...(all[api][agentId] ?? {}), ...seen })) {
+    const at = new Date(mark?.opened_at).getTime();
+    if (typeof mark?.message_id === "string" && Number.isFinite(at) && now.getTime() - at < KEEP_MS) kept[commitment] = mark;
   }
   all[api][agentId] = kept;
   await writeAll(file, all);

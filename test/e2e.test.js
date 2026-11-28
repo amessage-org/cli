@@ -2,141 +2,179 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
+  associatedData,
   b64,
-  deriveX25519,
+  dayKeyProblem,
+  dayStart,
+  ENC_BYTES,
   envelopeStatement,
   fingerprint,
   generateIdentity,
+  generateXWing,
   hpkeInspect,
   hpkeOpen,
+  hpkeOpenAt,
   hpkeSeal,
   identityPublicOf,
   isEnvelope,
   keyId,
   keysProblem,
+  MAX_ENVELOPE_BYTES,
+  messageKeyFor,
   messageKeyStatement,
-  newMessageKey,
+  newMessageKeys,
   openExport,
   openMessage,
+  PUBLIC_BYTES,
   revealMatches,
   sealExport,
   sealMessage,
   signWith,
   unb64,
   verifyWith,
-  x25519Pair,
+  xwingPublicKey,
 } from "../src/e2e.js";
 
-const hex = (/** @type {string} */ s) => Buffer.from(s.replace(/\s/g, ""), "hex");
+// docs/design/encrypted-chats-vectors.json, copied: draft-ietf-hpke-pq's appendix A.5 vector, two
+// identities and Bob's day key from fixed seeds, and one envelope from Alice to Bob.
+const V = JSON.parse(readFileSync(new URL("./fixtures/encrypted-chats-vectors.json", import.meta.url), "utf8"));
+const hex = (/** @type {string} */ s) => Buffer.from(s, "hex");
+const EMPTY = Buffer.alloc(0);
 
-// RFC 9180, Appendix A.1: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, base mode.
-const A1 = {
-  info: hex("4f6465206f6e2061204772656369616e2055726e"),
-  ikmE: hex("7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234"),
-  pkEm: "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
-  skEm: "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736",
-  ikmR: hex("6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037"),
-  pkRm: "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
-  skRm: "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
-  sharedSecret: "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc",
-  key: "4531685d41d65f03dc48f6b8302c05b0",
-  baseNonce: "56d890e5accaaf011cff4b7d",
-  pt: hex("4265617574792069732074727574682c20747275746820626561757479"),
-  aad: hex("436f756e742d30"),
-  ct: "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
-};
-
-const VECTORS = JSON.parse(readFileSync(new URL("./fixtures/encrypted-chats-vectors.json", import.meta.url), "utf8"));
-
-test("HPKE matches RFC 9180 A.1: derived keys, shared secret, key schedule and the first seal", () => {
-  const e = deriveX25519(A1.ikmE);
-  const r = deriveX25519(A1.ikmR);
-  assert.equal(e.publicKey.toString("hex"), A1.pkEm);
-  assert.equal(e.privateKey.toString("hex"), A1.skEm);
-  assert.equal(r.publicKey.toString("hex"), A1.pkRm);
-  assert.equal(r.privateKey.toString("hex"), A1.skRm);
-  const sealed = hpkeSeal(r.publicKey, A1.info, A1.aad, A1.pt, e);
-  assert.equal(sealed.enc.toString("hex"), A1.pkEm);
-  const schedule = hpkeInspect(sealed.enc, r.privateKey, A1.info);
-  assert.equal(schedule.shared.toString("hex"), A1.sharedSecret);
-  assert.equal(schedule.key.toString("hex"), A1.key);
-  assert.equal(schedule.nonce.toString("hex"), A1.baseNonce);
-  assert.equal(sealed.ct.toString("hex"), A1.ct);
-  assert.deepEqual(hpkeOpen(r.privateKey, sealed.enc, A1.info, A1.aad, sealed.ct), A1.pt);
-  const tampered = Buffer.from(sealed.ct);
+test("HPKE matches draft-ietf-hpke-pq A.5: the X-Wing public key, shared secret, key schedule and each message", () => {
+  const h = V.hpke;
+  assert.equal(xwingPublicKey(hex(h.skRm)).toString("hex"), h.pkRm);
+  assert.equal(hex(h.pkRm).length, PUBLIC_BYTES);
+  assert.equal(hex(h.enc).length, ENC_BYTES);
+  const schedule = hpkeInspect(hex(h.skRm), hex(h.enc), hex(h.info));
+  assert.equal(schedule.shared.toString("hex"), h.shared_secret);
+  assert.equal(schedule.key.toString("hex"), h.key);
+  assert.equal(schedule.nonce.toString("hex"), h.base_nonce);
+  assert.ok(h.encryptions.length >= 2);
+  for (const e of h.encryptions) {
+    assert.equal(hpkeOpenAt(hex(h.skRm), hex(h.enc), hex(h.info), hex(e.aad), hex(e.ct), hex(e.nonce)).toString("hex"), e.pt, `seq ${e.seq}`);
+  }
+  // The first message is single-shot HPKE: it opens with the base nonce.
+  const first = h.encryptions[0];
+  assert.equal(first.nonce, h.base_nonce);
+  assert.equal(hpkeOpen(hex(h.skRm), hex(h.enc), hex(h.info), hex(first.aad), hex(first.ct)).toString("hex"), first.pt);
+  const tampered = hex(first.ct);
   tampered[0] ^= 1;
-  assert.throws(() => hpkeOpen(r.privateKey, sealed.enc, A1.info, A1.aad, tampered));
-  assert.throws(() => hpkeOpen(r.privateKey, sealed.enc, A1.info, Buffer.from("other"), sealed.ct));
+  assert.throws(() => hpkeOpen(hex(h.skRm), hex(h.enc), hex(h.info), hex(first.aad), tampered));
+  assert.throws(() => hpkeOpen(hex(h.skRm), hex(h.enc), hex(h.info), Buffer.from("other"), hex(first.ct)));
+  assert.throws(() => hpkeOpen(hex(h.skRm), hex(h.enc).subarray(1), hex(h.info), hex(first.aad), hex(first.ct)), /X-Wing ciphertext/);
 });
 
-test("sealing the spec's fixed inputs gives its envelope exactly, and opening it gives the payload", () => {
-  const v = VECTORS;
-  const alice = { privateKey: unb64(v.alice_identity.private), publicKey: unb64(v.alice_identity.public) };
-  const bob = { privateKey: unb64(v.bob_identity.private), publicKey: unb64(v.bob_identity.public) };
-  assert.deepEqual(identityPublicOf(alice.privateKey), alice.publicKey);
-  assert.deepEqual(identityPublicOf(bob.privateKey), bob.publicKey);
-  assert.equal(fingerprint(alice.publicKey), v.alice_identity.fingerprint);
-  assert.equal(fingerprint(bob.publicKey), v.bob_identity.fingerprint);
-  // Bob's message key: its id, its public half, and the identity key's signature on it.
-  const bobKey = v.bob_message_key;
-  assert.deepEqual(x25519Pair(unb64(bobKey.private)).publicKey, unb64(bobKey.public_key));
-  assert.equal(keyId(unb64(bobKey.public_key)), bobKey.key_id);
-  assert.equal(verifyWith(bob.publicKey, messageKeyStatement(bobKey.public_key, bobKey.expires_at), bobKey.signature), true);
-  const published = { identity_key: v.bob_identity.public, fingerprint: v.bob_identity.fingerprint, message_key: bobKey };
-  assert.equal(keysProblem(published, new Date(v.sent_at)), null);
-  assert.equal(keysProblem(published, new Date(bobKey.expires_at)), "the message key has ended");
-  assert.equal(keysProblem({ ...published, fingerprint: v.alice_identity.fingerprint }, new Date(v.sent_at)), "the fingerprint isn't the identity key's");
+test("HPKE seals with fresh randomness to a new X-Wing key, and only that key opens it", () => {
+  const r = generateXWing();
+  assert.equal(r.privateKey.length, 32);
+  assert.deepEqual(xwingPublicKey(r.privateKey), r.publicKey);
+  const info = Buffer.from("amessage e2e v2");
+  const one = hpkeSeal(r.publicKey, info, Buffer.from("aad"), Buffer.from("hello"));
+  const two = hpkeSeal(r.publicKey, info, Buffer.from("aad"), Buffer.from("hello"));
+  assert.equal(one.enc.length, ENC_BYTES);
+  assert.equal(one.ct.length, 5 + 16);
+  assert.notDeepEqual(one.enc, two.enc);
+  assert.equal(hpkeOpen(r.privateKey, one.enc, info, Buffer.from("aad"), one.ct).toString(), "hello");
+  assert.throws(() => hpkeOpen(generateXWing().privateKey, one.enc, info, Buffer.from("aad"), one.ct));
+  assert.throws(() => hpkeOpen(r.privateKey, one.enc, Buffer.from("amessage e2e v1"), Buffer.from("aad"), one.ct));
+  assert.throws(() => hpkeSeal(r.publicKey.subarray(1), info, EMPTY, EMPTY), /1,216 bytes/);
+});
 
-  const payload = JSON.parse(v.plaintext_payload);
-  const envelope = sealMessage({
-    text: payload.text,
-    from: payload.from,
-    to: payload.to,
-    identityPrivate: alice.privateKey,
-    identityPublic: alice.publicKey,
-    recipientKey: bobKey,
-    now: new Date(v.sent_at),
-    ephemeral: x25519Pair(unb64(v.ephemeral_private)),
-    frankingKey: unb64(v.franking_key),
-  });
-  assert.equal(JSON.stringify(envelope), JSON.stringify(v.envelope));
-  assert.equal(isEnvelope(envelope), true);
+test("the vector file's identities, day key, statements and signatures come out byte for byte, and its envelope opens", () => {
+  const alice = unb64(V.alice_identity.private);
+  const bob = unb64(V.bob_identity.private);
+  assert.equal(b64(identityPublicOf(alice)), V.alice_identity.public);
+  assert.equal(b64(identityPublicOf(bob)), V.bob_identity.public);
+  assert.equal(fingerprint(unb64(V.alice_identity.public)), V.alice_identity.fingerprint);
+  assert.equal(fingerprint(unb64(V.bob_identity.public)), V.bob_identity.fingerprint);
+
+  // Bob's day key for 2026-12-01, from its seed: public key, key id, both dates and the signature.
+  const { private_seed, statement, ...published } = V.bob_day_key;
+  const day = messageKeyFor(bob, unb64(private_seed), new Date("2026-12-01T18:00:00Z"));
+  assert.equal(JSON.stringify(day.public), JSON.stringify(published));
+  assert.equal(keyId(unb64(published.public_key)), published.key_id);
+  assert.equal(messageKeyStatement(published.public_key, published.valid_from, published.expires_at), statement);
+  assert.equal(signWith(bob, statement), published.signature);
+  assert.equal(verifyWith(unb64(V.bob_identity.public), statement, published.signature), true);
+  assert.equal(dayKeyProblem(unb64(V.bob_identity.public), published), null);
+
+  // The keys as aMessage gives them hold together on their day, give or take a day of clock skew.
+  const keys = { identity_key: V.bob_identity.public, fingerprint: V.bob_identity.fingerprint, message_key: published };
+  assert.equal(keysProblem(keys, new Date(V.sent_at)), null);
+  assert.equal(keysProblem(keys, new Date("2026-12-02T23:59:00Z")), null);
+  assert.equal(keysProblem(keys, new Date("2026-12-03T00:00:00Z")), "the day key has ended");
+  assert.equal(keysProblem(keys, new Date("2026-11-29T23:59:00Z")), "the day key's day hasn't come");
+  assert.equal(keysProblem({ ...keys, fingerprint: V.alice_identity.fingerprint }, new Date(V.sent_at)), "the fingerprint isn't the identity key's");
+  assert.equal(keysProblem({ ...keys, identity_key: V.alice_identity.public, fingerprint: V.alice_identity.fingerprint }, new Date(V.sent_at)), "the identity key didn't sign the day key");
+  assert.equal(keysProblem({ ...keys, message_key: { ...published, expires_at: "2026-12-03T00:00:00.000Z" } }, new Date(V.sent_at)), "the day key doesn't cover one UTC day");
+  assert.equal(keysProblem({ ...keys, message_key: { ...published, public_key: b64(Buffer.alloc(32)) } }, new Date(V.sent_at)), "the day key isn't 1,216 bytes");
+
+  // The envelope: its signed statement, its associated data, its signature, and what it opens to.
+  const e = V.envelope;
+  assert.equal(isEnvelope(e), true);
+  assert.equal(envelopeStatement(e), V.envelope_statement);
+  assert.equal(associatedData(e.sender_key, e.recipient_key).toString(), V.associated_data);
+  assert.equal(verifyWith(unb64(V.alice_identity.public), V.envelope_statement, e.sig), true);
+  const payload = JSON.parse(V.plaintext_payload);
   const opened = openMessage({
-    envelope: v.envelope,
-    messagePrivate: unb64(bobKey.private),
-    senderIdentityPublic: alice.publicKey,
+    envelope: e,
+    messagePrivate: unb64(private_seed),
+    senderIdentityPublic: unb64(V.alice_identity.public),
     me: payload.to,
     sender: payload.from,
   });
-  assert.equal(JSON.stringify(opened), v.plaintext_payload);
-  assert.equal(revealMatches(opened.franking_key, opened.text, v.envelope.commitment), true);
+  assert.equal(JSON.stringify(opened), V.plaintext_payload);
+  assert.equal(opened.franking_key, V.franking_key);
+  assert.equal(opened.sent_at, V.sent_at);
+  assert.equal(revealMatches(opened.franking_key, opened.text, e.commitment), true);
+  assert.equal(revealMatches(opened.franking_key, `${opened.text}!`, e.commitment), false);
 });
 
-test("a sealed message opens only for its recipient, and every kind of tampering is refused", () => {
+test("day keys cover one UTC day each, seven at a time, and only today's opens what was sealed to it", () => {
   const alice = generateIdentity();
   const bob = generateIdentity();
-  const bobKey = newMessageKey(bob.privateKey);
-  assert.equal(verifyWith(bob.publicKey, messageKeyStatement(bobKey.public.public_key, bobKey.public.expires_at), bobKey.public.signature), true);
+  const keys = newMessageKeys(bob.privateKey, new Date("2026-12-03T10:00:00Z"));
+  assert.equal(keys.length, 7);
+  assert.deepEqual(
+    keys.map((k) => k.public.valid_from),
+    Array.from({ length: 7 }, (_, i) => new Date(Date.UTC(2026, 11, 3 + i)).toISOString()),
+  );
+  for (const k of keys) {
+    assert.equal(Date.parse(k.public.expires_at) - Date.parse(k.public.valid_from), 86_400_000);
+    assert.equal(dayKeyProblem(bob.publicKey, k.public), null);
+    assert.equal(dayKeyProblem(alice.publicKey, k.public), "the identity key didn't sign the day key");
+  }
+  assert.equal(new Set(keys.map((k) => k.public.key_id)).size, 7);
+  assert.equal(dayStart(new Date("2026-12-03T23:59:59.999Z")).toISOString(), "2026-12-03T00:00:00.000Z");
+  const today = keys[0];
+
   const envelope = sealMessage({
     text: "Can you check the build log?",
     from: "alice-id",
     to: "bob-id",
     identityPrivate: alice.privateKey,
     identityPublic: alice.publicKey,
-    recipientKey: bobKey.public,
+    recipientKey: today.public,
   });
   assert.equal(isEnvelope(envelope), true);
+  assert.deepEqual(Object.keys(envelope), ["v", "suite", "sender_key", "recipient_key", "enc", "ct", "commitment", "sig"]);
+  assert.equal(envelope.v, 2);
+  assert.equal(envelope.suite, "mlkem768x25519-hkdf-sha256-chacha20poly1305");
   assert.equal(envelope.sender_key, fingerprint(alice.publicKey));
-  const read = (e = envelope, me = "bob-id", sender = "alice-id", from = alice.publicKey) =>
-    openMessage({ envelope: e, messagePrivate: bobKey.privateKey, senderIdentityPublic: from, me, sender });
+  assert.equal(envelope.recipient_key, today.public.key_id);
+  const read = (e = envelope, me = "bob-id", sender = "alice-id", from = alice.publicKey, key = today.privateKey) =>
+    openMessage({ envelope: e, messagePrivate: key, senderIdentityPublic: from, me, sender });
   const payload = read();
   assert.equal(payload.text, "Can you check the build log?");
   assert.equal(revealMatches(payload.franking_key, payload.text, envelope.commitment), true);
-  assert.equal(revealMatches(payload.franking_key, "Something else", envelope.commitment), false);
+  assert.throws(() => read(envelope, "bob-id", "alice-id", alice.publicKey, keys[1].privateKey));
 
   const flip = (/** @type {string} */ s) => b64(Buffer.from(unb64(s).map((byte, i) => (i === 0 ? byte ^ 1 : byte))));
   assert.throws(() => read({ ...envelope, ct: flip(envelope.ct) }));
+  assert.throws(() => read({ ...envelope, enc: flip(envelope.enc) }));
   assert.throws(() => read({ ...envelope, commitment: flip(envelope.commitment) }), /signature/);
+  assert.throws(() => read({ ...envelope, v: /** @type {any} */ (1) }), /unknown envelope version/);
   assert.throws(() => read(envelope, "carol-id"), /other agents/);
   assert.throws(() => read(envelope, "bob-id", "mallory-id"), /other agents/);
   assert.throws(() => read(envelope, "bob-id", "alice-id", bob.publicKey), /sender's key/);
@@ -147,10 +185,23 @@ test("a sealed message opens only for its recipient, and every kind of tampering
   const forged = { ...envelope, sender_key: fingerprint(mallory.publicKey) };
   const signed = { ...forged, sig: signWith(mallory.privateKey, envelopeStatement(forged)) };
   assert.throws(() => read(signed, "bob-id", "alice-id", mallory.publicKey), /unable to authenticate|Unsupported state/);
-  assert.match(envelopeStatement(envelope), new RegExp(envelope.ct));
+  assert.match(envelopeStatement(envelope), new RegExp(`^amessage e2e v2 envelope\n${envelope.suite}\n`));
   assert.equal(isEnvelope({ ...envelope, extra: 1 }), false);
-  assert.equal(isEnvelope({ ...envelope, v: 2 }), false);
-  assert.equal(isEnvelope({ ...envelope, enc: "short" }), false);
+  assert.equal(isEnvelope({ ...envelope, v: 1 }), false);
+  assert.equal(isEnvelope({ ...envelope, suite: "x25519-hkdf-sha256-aes128gcm" }), false);
+  assert.equal(isEnvelope({ ...envelope, enc: b64(Buffer.alloc(32)) }), false);
+
+  // 2,000 characters in any script fit under the limit.
+  const wide = sealMessage({
+    text: "界".repeat(2000),
+    from: "alice-id",
+    to: "bob-id",
+    identityPrivate: alice.privateKey,
+    identityPublic: alice.publicKey,
+    recipientKey: today.public,
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(wide)) < MAX_ENVELOPE_BYTES);
+  assert.equal(MAX_ENVELOPE_BYTES, 14_336);
 });
 
 test("an export opens with its passphrase only, and a changed one doesn't open", () => {

@@ -1,30 +1,43 @@
-// This agent's side of encrypted chats: its keys in keys.json, the fingerprints it pinned for
-// its chat partners, sealing what it sends and opening what it gets, and copies of what it sent
-// in sent.json (it can't open its own envelopes: they're sealed to the recipient's key).
-// Private keys stay in keys.json: nothing here prints them, sends them or returns them.
+// This agent's side of encrypted chats: its keys in keys.json (an identity key, and a key for
+// each UTC day, published a week at a time), the fingerprints it pinned for its chat partners,
+// sealing what it sends and opening what it gets, copies of what it sent in sent.json (it can't
+// open its own envelopes: they're sealed to the recipient's key), and the commitments it opened
+// in seen.json, to drop replays. Private keys stay in keys.json: nothing here prints them, sends
+// them or returns them.
 
 import { ApiError } from "./api.js";
-import { addSent, loadKeyring, loadSent, updateKeyEntry } from "./config.js";
+import { addSeen, addSent, loadKeyring, loadSeen, loadSent, updateKeyEntry } from "./config.js";
 import {
   b64,
+  DAY_MS,
+  DAYS_AHEAD,
+  dayStart,
   envelopeBytes,
   fingerprint,
   generateIdentity,
+  generateXWing,
   identityPublicOf,
+  isBytes,
   isEnvelope,
+  isOneDay,
   keyId,
   keysProblem,
+  MAX_DAYS,
   MAX_ENVELOPE_BYTES,
+  messageKeyFor,
   messageKeyStatement,
-  newMessageKey,
   openMessage,
+  PUBLIC_BYTES,
   sealMessage,
   unb64,
   verifyWith,
-  x25519Pair,
+  xwingPublicKey,
 } from "./e2e.js";
 
-const DAY_MS = 86_400_000;
+/** Day keys are published again when fewer than this many days of them are left. */
+export const PUBLISH_BELOW_DAYS = 3;
+/** Private day keys are kept as long as aMessage keeps the messages sealed to them. */
+const KEEP_KEYS_MS = 180 * DAY_MS;
 export const COULD_NOT_OPEN = "(couldn't open this encrypted message)";
 export const NO_COPY = "(sent encrypted; no copy on this machine)";
 
@@ -70,56 +83,103 @@ export function spaced(value) {
  */
 
 /**
- * The message key new messages are sealed to: of those this identity signed, the one that lasts
- * longest. (Keys an older identity signed still open the messages sealed to them.)
+ * The day keys this identity signed, by day. (Keys an older identity signed still open the
+ * messages sealed to them, but aren't published again.)
  * @param {KeyEntry} entry
  */
-export function currentKey(entry) {
+function signedDayKeys(entry) {
   const identity = unb64(entry.identity.public);
-  return (
-    [...(entry.message_keys ?? [])]
-      .filter((k) => verifyWith(identity, messageKeyStatement(k.public_key, k.expires_at), k.signature))
-      .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at))[0] ?? null
-  );
+  return (entry.message_keys ?? [])
+    .filter((k) => isOneDay(k.valid_from, k.expires_at) && verifyWith(identity, messageKeyStatement(k.public_key, k.valid_from, k.expires_at), k.signature))
+    .sort((a, b) => Date.parse(a.valid_from) - Date.parse(b.valid_from));
 }
 
-/** A stored message key without its private half. @param {StoredMessageKey} key @returns {import("./e2e.js").MessageKey} */
-export const publicPart = (key) => ({ key_id: key.key_id, public_key: key.public_key, expires_at: key.expires_at, signature: key.signature });
-
-/** A new message key, signed by the identity, as keys.json keeps it. @param {KeyEntry} entry @param {Date} [now] @returns {StoredMessageKey} */
-function freshMessageKey(entry, now = new Date()) {
-  const made = newMessageKey(unb64(entry.identity.private), now);
-  return { ...made.public, private: b64(made.privateKey) };
+/** The day key messages are sealed to on the day `at` falls in, or null. @param {KeyEntry} entry @param {Date} [at] */
+export function currentKey(entry, at = new Date()) {
+  const t = at.getTime();
+  return signedDayKeys(entry).find((k) => Date.parse(k.valid_from) <= t && t < Date.parse(k.expires_at)) ?? null;
 }
 
-/** A new identity and its first message key. @returns {KeyEntry} */
-export function newEntry() {
+/** The end of the last day this identity has a key for here, or null. @param {KeyEntry} entry @returns {string | null} */
+export function keysUntil(entry) {
+  return signedDayKeys(entry).at(-1)?.expires_at ?? null;
+}
+
+/** Whether day keys that last until `until` are enough, or it is time to publish more. @param {unknown} until @param {number} [now] */
+export function enoughLeft(until, now = Date.now()) {
+  const end = typeof until === "string" ? Date.parse(until) : NaN;
+  return Number.isFinite(end) && end - now >= PUBLISH_BELOW_DAYS * DAY_MS;
+}
+
+/** A stored day key without its private half. @param {StoredMessageKey} key @returns {import("./e2e.js").MessageKey} */
+export const publicPart = (key) => ({ key_id: key.key_id, public_key: key.public_key, valid_from: key.valid_from, expires_at: key.expires_at, signature: key.signature });
+
+/**
+ * The entry with a day key for each of the next 7 days from today, made where one is missing,
+ * and without the day keys whose day ended more than 180 days ago. Also the keys it made.
+ * @param {KeyEntry} entry @param {Date} [now] @returns {{ entry: KeyEntry, made: StoredMessageKey[] }}
+ */
+export function withWeekAhead(entry, now = new Date()) {
+  const have = new Set(signedDayKeys(entry).map((k) => k.valid_from));
+  const identityPrivate = unb64(entry.identity.private);
+  /** @type {StoredMessageKey[]} */
+  const made = [];
+  for (let i = 0; i < DAYS_AHEAD; i++) {
+    const day = new Date(dayStart(now).getTime() + i * DAY_MS);
+    if (have.has(day.toISOString())) continue;
+    const key = messageKeyFor(identityPrivate, generateXWing().privateKey, day);
+    // In the order keys.json keeps them.
+    made.push({
+      key_id: key.public.key_id,
+      private: b64(key.privateKey),
+      public_key: key.public.public_key,
+      valid_from: key.public.valid_from,
+      expires_at: key.public.expires_at,
+      signature: key.public.signature,
+    });
+  }
+  const kept = (entry.message_keys ?? []).filter((k) => now.getTime() - Date.parse(k.expires_at) < KEEP_KEYS_MS);
+  return { entry: { ...entry, message_keys: [...kept, ...made] }, made };
+}
+
+/** A new identity and its day keys for the next 7 days. @param {Date} [now] @returns {KeyEntry} */
+export function newEntry(now = new Date()) {
   const identity = generateIdentity();
   /** @type {KeyEntry} */
   const entry = { identity: { private: b64(identity.privateKey), public: b64(identity.publicKey) }, message_keys: [], pins: {} };
-  entry.message_keys.push(freshMessageKey(entry));
-  return entry;
+  return withWeekAhead(entry, now).entry;
 }
 
 /**
- * Whether an entry read from an export is whole: each public key is its private key's, and each
- * key id its key's. Throws when not.
+ * Whether an entry read from an export is whole: each public key is its private key's, each key
+ * id its key's, and each day key covers one UTC day. Version 1 message keys (without valid_from)
+ * are dropped, as from keys.json. Throws when not.
  * @param {any} entry @returns {KeyEntry}
  */
 export function checkEntry(entry) {
   const bad = (/** @type {string} */ why) => new Error(`The export doesn't hold usable keys: ${why}.`);
-  const raw32 = (/** @type {unknown} */ s) => typeof s === "string" && /^[A-Za-z0-9_-]{43}$/.test(s) && unb64(s).length === 32;
-  if (!entry || typeof entry !== "object" || !raw32(entry.identity?.private) || !raw32(entry.identity?.public)) throw bad("no identity key");
+  if (!entry || typeof entry !== "object" || !isBytes(entry.identity?.private, 32) || !isBytes(entry.identity?.public, 32)) throw bad("no identity key");
   if (!identityPublicOf(unb64(entry.identity.private)).equals(unb64(entry.identity.public))) throw bad("the identity key doesn't match itself");
-  if (!Array.isArray(entry.message_keys) || !entry.message_keys.length) throw bad("no message keys");
-  for (const key of entry.message_keys) {
-    if (!raw32(key?.private) || !raw32(key?.public_key)) throw bad("a message key isn't 32 bytes");
-    if (!x25519Pair(unb64(key.private)).publicKey.equals(unb64(key.public_key)) || key.key_id !== keyId(unb64(key.public_key)))
-      throw bad("a message key doesn't match itself");
+  if (!Array.isArray(entry.message_keys)) throw bad("no day keys");
+  const keys = entry.message_keys.filter((/** @type {any} */ key) => typeof key?.valid_from === "string");
+  for (const key of keys) {
+    if (!isBytes(key.private, 32) || !isBytes(key.public_key, PUBLIC_BYTES)) throw bad("a day key isn't the right size");
+    if (!xwingPublicKey(unb64(key.private)).equals(unb64(key.public_key)) || key.key_id !== keyId(unb64(key.public_key)))
+      throw bad("a day key doesn't match itself");
+    if (!isOneDay(key.valid_from, key.expires_at) || typeof key.signature !== "string") throw bad("a day key doesn't cover one UTC day");
   }
   const pins = entry.pins && typeof entry.pins === "object" ? entry.pins : {};
   for (const value of Object.values(pins)) if (!/^[0-9a-f]{64}$/.test(String(value))) throw bad("a pinned fingerprint isn't one");
-  return { identity: entry.identity, message_keys: entry.message_keys, pins };
+  /** @type {StoredMessageKey[]} */
+  const message_keys = keys.map((/** @type {StoredMessageKey} */ k) => ({
+    key_id: k.key_id,
+    private: k.private,
+    public_key: k.public_key,
+    valid_from: k.valid_from,
+    expires_at: k.expires_at,
+    signature: k.signature,
+  }));
+  return { identity: { private: entry.identity.private, public: entry.identity.public }, message_keys, pins };
 }
 
 /** @type {WeakMap<object, ReturnType<typeof keyring>>} */
@@ -152,7 +212,7 @@ function keyring(ctx, client) {
 
   /**
    * This agent's keys on this machine, or null. Read from disk every time, so a long-running MCP
-   * server sees a rotation done in a terminal. Asks the API who this is only when there are keys.
+   * server sees keys published from a terminal. Asks the API who this is only when there are keys.
    * @returns {Promise<Own | null>}
    */
   async function mine() {
@@ -167,45 +227,69 @@ function keyring(ctx, client) {
     return updateKeyEntry(ctx.keysFile, ctx.api, await whoAmI(), change);
   }
 
-  /** Publish the identity and the current message key. @param {KeyEntry} entry */
+  /**
+   * Publish the identity and its day keys that haven't ended, today's among them: PUT /v1/me/keys
+   * takes them as a list.
+   * @param {KeyEntry} entry
+   */
   async function publish(entry) {
-    const key = currentKey(entry);
-    if (!key) throw new E2EError("This agent's keys have no message key.", "Make one with: amessage keys rotate");
-    return client.publishKeys({ identity_key: entry.identity.public, message_key: publicPart(key) });
-  }
-
-  /** A new message key, kept and published. An unpublished one is dropped again, so nobody seals to it. */
-  async function rotate() {
-    const own = await mine();
-    if (!own) throw new E2EError("This agent has no keys for encrypted chats yet.", "Make them with: amessage keys create");
-    const key = freshMessageKey(own.entry);
-    const entry = await update((e) => ({ ...(e ?? own.entry), message_keys: [...(e ?? own.entry).message_keys, key] }));
-    try {
-      await publish(entry);
-    } catch (error) {
-      await update((e) => ({ ...(e ?? entry), message_keys: (e ?? entry).message_keys.filter((k) => k.key_id !== key.key_id) }));
-      throw error;
-    }
-    return key;
+    if (!currentKey(entry)) throw new E2EError("This agent's keys have no day key for today.", "Make one with: amessage keys create");
+    const now = Date.now();
+    const keys = signedDayKeys(entry).filter((k) => Date.parse(k.expires_at) > now);
+    return client.publishKeys({ identity_key: entry.identity.public, message_keys: keys.slice(0, MAX_DAYS).map(publicPart) });
   }
 
   /**
-   * Before any chat command: a new message key when the current one has less than a day left.
-   * A failed rotation never stops the command; it says so, and the next command tries again.
+   * Day keys for each of the next 7 days, made where missing, kept and published. Keys made here
+   * that the publish didn't take are dropped again, so the next command tries anew. Unless
+   * `replacing` (the person said yes), it never publishes over an identity another machine holds:
+   * GET /v1/me names it even when its day keys ran out.
+   * @param {boolean} [replacing]
+   */
+  async function renew(replacing = false) {
+    const own = await mine();
+    if (!own) throw new E2EError("This agent has no keys for encrypted chats yet.", "Make them with: amessage keys create");
+    if (!replacing) {
+      const there = (await client.me())?.encryption?.fingerprint;
+      if (there && there !== fingerprint(unb64(own.entry.identity.public)))
+        throw new E2EError(
+          `aMessage has other keys for this agent (fingerprint ${spaced(there)}), made on another machine, so none were published from here.`,
+          "Publish the keys on this machine in their place with: amessage keys create, or bring the others here with: amessage keys import <file>",
+        );
+    }
+    /** @type {StoredMessageKey[]} */
+    let made = [];
+    const entry = await update((e) => {
+      const next = withWeekAhead(e ?? own.entry);
+      made = next.made;
+      return next.entry;
+    });
+    try {
+      await publish(entry);
+    } catch (error) {
+      const unpublished = new Set(made.map((k) => k.key_id));
+      if (unpublished.size) await update((e) => ({ ...(e ?? entry), message_keys: (e ?? entry).message_keys.filter((k) => !unpublished.has(k.key_id)) }));
+      throw error;
+    }
+    return entry;
+  }
+
+  /**
+   * Before any chat command: the next week's day keys, published when fewer than 3 days of them
+   * are left. A failed publish never stops the command; it says so, and the next command tries again.
    */
   async function fresh() {
     const own = await mine();
     if (!own) return null;
-    const key = currentKey(own.entry);
     // A long-running MCP server checks at most once a minute.
     if (Date.now() - checkedFresh < 60_000) return own;
     checkedFresh = Date.now();
-    if (key && Date.parse(key.expires_at) - Date.now() >= DAY_MS) return own;
+    if (enoughLeft(keysUntil(own.entry))) return own;
     try {
-      const made = await rotate();
-      ctx.note(`Made a new message key for encrypted chats; it lasts until ${made.expires_at.slice(0, 10)}.`);
+      const entry = await renew();
+      ctx.note(`Published new keys for encrypted chats; they last until ${String(keysUntil(entry)).slice(0, 10)}.`);
     } catch (error) {
-      ctx.warn(`Could not make a new message key for encrypted chats: ${/** @type {Error} */ (error).message}`);
+      ctx.warn(`Could not publish new keys for encrypted chats: ${/** @type {Error} */ (error).message}`);
     }
     return mine();
   }
@@ -336,7 +420,8 @@ function keyring(ctx, client) {
 
   /**
    * Open the envelope of every message given that has one: theirs with this machine's keys, this
-   * agent's own from the copies kept when it sent them.
+   * agent's own from the copies kept when it sent them. An envelope whose commitment was opened
+   * before under another message id is a replay, and isn't opened; the same message read again is.
    * @param {any[]} messages
    * @returns {Promise<Map<any, Opened>>}
    */
@@ -348,15 +433,30 @@ function keyring(ctx, client) {
     const own = await mine().catch(() => null);
     const me = own?.agentId ?? (await whoAmI().catch(() => null));
     const copies = me ? await loadSent(ctx.sentFile, ctx.api, me) : {};
-    for (const message of sealed) opened.set(message, await openOne(own, me, copies, message));
+    const seen = { before: me ? await loadSeen(ctx.seenFile, ctx.api, me) : {}, added: /** @type {Record<string, import("./config.js").SeenCommitment>} */ ({}) };
+    // Oldest first, so of two messages with the same commitment, the later one is the replay.
+    const when = (/** @type {any} */ m) => {
+      const at = Date.parse(m.posted_at);
+      return Number.isFinite(at) ? at : Infinity;
+    };
+    for (const message of [...sealed].sort((a, b) => when(a) - when(b) || 0)) opened.set(message, await openOne(own, me, copies, seen, message));
+    if (me && Object.keys(seen.added).length) {
+      try {
+        await addSeen(ctx.seenFile, ctx.api, me, seen.added);
+      } catch (error) {
+        ctx.warn(`Could not keep what was opened, to drop replays: ${/** @type {Error} */ (error).message}`);
+      }
+    }
     return opened;
   }
 
   /**
-   * @param {Own | null} own @param {string | null} me @param {Record<string, import("./config.js").SentCopy>} copies @param {any} message
+   * @param {Own | null} own @param {string | null} me @param {Record<string, import("./config.js").SentCopy>} copies
+   * @param {{ before: Record<string, import("./config.js").SeenCommitment>, added: Record<string, import("./config.js").SeenCommitment> }} seen
+   * @param {any} message
    * @returns {Promise<Opened>}
    */
-  async function openOne(own, me, copies, message) {
+  async function openOne(own, me, copies, seen, message) {
     const sender = message.sender_agent_id;
     if (me && sender === me) {
       const copy = copies[message.id];
@@ -379,6 +479,11 @@ function keyring(ctx, client) {
         me: own.agentId,
         sender,
       });
+      // A message with no id can't be told apart from a replay of one already opened.
+      const id = typeof message.id === "string" ? message.id : null;
+      const before = seen.before[envelope.commitment];
+      if (before && before.message_id !== id) return fail("it repeats a message opened before (a replay)");
+      if (!before && id) seen.before[envelope.commitment] = seen.added[envelope.commitment] = { message_id: id, opened_at: new Date().toISOString() };
       const pinned = own.entry.pins?.[sender];
       if (!pinned) {
         await pin(sender, envelope.sender_key);
@@ -411,9 +516,9 @@ function keyring(ctx, client) {
 
   /**
    * What aMessage has for this agent: its identity's fingerprint, from GET /v1/me, which gives it
-   * even after the weekly message key lapsed (when GET /v1/me/keys says 404), and its current
-   * keys when it has them.
-   * @returns {Promise<{ fingerprint: string | null, keys: AgentKeys | null }>}
+   * even after its day keys ran out (when GET /v1/me/keys says 404), and its keys for today, with
+   * keys_until, when it has them.
+   * @returns {Promise<{ fingerprint: string | null, keys: import("./api.js").MyKeys | null }>}
    */
   async function published() {
     const [me, keys] = await Promise.all([client.me(), client.myKeys()]);
@@ -432,20 +537,12 @@ function keyring(ctx, client) {
     const there = await published();
     const ours = own ? fingerprint(unb64(own.entry.identity.public)) : null;
     if (own && there.fingerprint === ours) {
-      // The same identity: publish the current message key only if aMessage lacks it.
+      // The same identity: publish only if aMessage lacks today's key, or has fewer than 3 days left.
       const key = currentKey(own.entry);
-      if (key && there.keys?.message_key?.key_id === key.key_id) return { made: false, published: false, entry: own.entry };
+      if (key && there.keys?.message_key?.key_id === key.key_id && enoughLeft(there.keys.keys_until) && enoughLeft(keysUntil(own.entry)))
+        return { made: false, published: false, entry: own.entry };
     } else if (there.fingerprint) await replacing(there.fingerprint);
-    if (own) {
-      let entry = own.entry;
-      const key = currentKey(entry);
-      if (!key || Date.parse(key.expires_at) - Date.now() < DAY_MS) {
-        const next = freshMessageKey(entry);
-        entry = await update((e) => ({ ...(e ?? entry), message_keys: [...(e ?? entry).message_keys, next] }));
-      }
-      await publish(entry);
-      return { made: false, published: true, entry };
-    }
+    if (own) return { made: false, published: true, entry: await renew(true) };
     const entry = await update((e) => e ?? newEntry());
     await publish(entry);
     return { made: true, published: true, entry };
@@ -457,7 +554,7 @@ function keyring(ctx, client) {
     update,
     published,
     publish,
-    rotate,
+    renew,
     fresh,
     recipientKeys,
     pin,
